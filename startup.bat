@@ -1,76 +1,115 @@
 @echo off
 cls
-title UGA Installer & Runner
-color 0A
+title UGA Advanced Installer & Runner
+color 0B
 
-echo =========================================
-echo       Initializing UGA Setup...
-echo =========================================
+echo =======================================================
+echo              UGA AUTOMATED SETUP SCRIPT                
+echo =======================================================
+echo.
 
-:: 1. الفحص: التأكد من وجود Git
+:: 1. ENVIRONMENT VERIFICATION
+echo [1/7] Verifying system dependencies...
+
 where git >nul 2>nul
 if %errorlevel% neq 0 (
     color 0C
-    echo [ERROR] Git is not installed! 
-    echo Please install Git from https://git-scm.com and try again.
-    goto end
+    echo [ERROR] Git is missing!
+    echo Download link: https://git-scm.com
+    goto error_exit
 )
+echo [OK] Git is available.
 
-:: 2. الفحص: التأكد من وجود Python
 where python >nul 2>nul
 if %errorlevel% neq 0 (
     color 0C
-    echo [ERROR] Python is not installed!
-    echo Please install Python and check "Add Python to PATH".
-    goto end
+    echo [ERROR] Python is missing!
+    echo Install Python and check "Add Python to PATH".
+    goto error_exit
 )
+echo [OK] Python is available.
 
-:: 3. تحميل المشروع
+:: 2. FORCED CLEANUP (Delete folder if exists)
 echo.
-echo [1/4] Cloning repository...
+echo [2/7] Checking for existing installations...
 if exist UGA (
-    echo [INFO] Folder 'UGA' already exists. Skipping clone.
-    cd UGA
-    git pull
-) else (
-    git clone https://github.com
-    if %errorlevel% neq 0 (
+    echo [WARNING] Previous 'UGA' folder found. Wiping directory for a clean install...
+    rmdir /s /q UGA
+    if exist UGA (
         color 0C
-        echo [ERROR] Failed to clone repository. Check your internet.
-        goto end
+        echo [ERROR] Could not delete the existing folder. File might be in use.
+        goto error_exit
     )
-    cd UGA
+    echo [OK] Cleaned old directory successfully.
+) else (
+    echo [OK] No conflicting directories found.
 )
 
-:: 4. تحديث ملف المتطلبات
+:: 3. REPOSITORY CLONING
 echo.
-echo [2/4] Updating requirements.txt...
-:: الفحص لمنع تكرار السطر في الملف إذا تم تشغيل السكربت سابقاً
-findstr /C:"google-genai" requirements.txt >nul 2>nul
-if %errorlevel% neq 0 (
-    echo google-genai^>=0.8.0 >> requirements.txt
-)
-
-:: 5. تثبيت المكتبات
-echo.
-echo [3/4] Installing dependencies...
-python -m pip install --upgrade pip >nul
-pip install -r requirements.txt
+echo [3/7] Cloning fresh repository from GitHub...
+git clone https://github.com
 if %errorlevel% neq 0 (
     color 0C
-    echo [ERROR] Installation failed.
-    goto end
+    echo [ERROR] Repository cloning failed. Check your internet connection.
+    goto error_exit
+)
+echo [OK] Repository downloaded.
+
+:: 4. DIRECTORY TRANSITION
+echo.
+echo [4/7] Navigating into project directory...
+cd UGA
+if %errorlevel% neq 0 (
+    color 0C
+    echo [ERROR] Failed to access the 'UGA' directory.
+    goto error_exit
 )
 
-:: 6. تشغيل الأداة
+:: 5. INJECTING REQUIREMENTS
 echo.
-echo [4/4] Starting UGA Tool...
-echo =========================================
+echo [5/7] Injecting required library packages...
+if not exist requirements.txt (
+    echo. > requirements.txt
+)
+echo google-genai^>=0.8.0 >> requirements.txt
+echo [OK] Requirements tracking updated.
+
+:: 6. PACKAGE INSTALLATION & UPGRADE
 echo.
+echo [6/7] Upgrading package managers and installing dependencies...
+echo [INFO] Upgrading pip...
+python -m pip install --upgrade pip --user >nul 2>nul
+
+echo [INFO] Running installer (this may take a moment)...
+pip install -r requirements.txt --user --quiet
+if %errorlevel% neq 0 (
+    color 0C
+    echo [ERROR] Failed to install required Python modules.
+    goto error_exit
+)
+echo [OK] All dependencies successfully initialized.
+
+:: 7. APPLICATION LAUNCH
+echo.
+echo [7/7] Launching UGA Core Engine...
+echo -------------------------------------------------------
+color 0A
 python cli.py
+if %errorlevel% neq 0 (
+    color 0E
+    echo.
+    echo [WARNING] Application terminated with an error code: %errorlevel%
+)
+goto end
+
+:error_exit
+echo.
+echo -------------------------------------------------------
+echo Setup aborted due to a critical error.
+echo -------------------------------------------------------
 
 :end
 echo.
-echo =========================================
-echo Press any key to exit.
+echo Operation finished. Press any key to close this terminal.
 pause >nul
