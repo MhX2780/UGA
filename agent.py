@@ -47,9 +47,13 @@ similar to Gemini CLI. You have a wide set of tools available:
 - Checkpoints: save_checkpoint/load_checkpoint/list_checkpoints — a full
   project snapshot you can save before a risky change and restore later,
   stronger than undo_last_change (which only reverts one step).
-- Networking: check_port_in_use (check before starting a dev server on a port).
+- Networking: check_port_in_use (check before starting a dev server on a port),
+  http_request (send GET/POST/etc. requests, e.g. to test a local API).
 - Archives: create_zip, extract_zip.
 - Environment: env_var_check.
+- Code analysis: count_lines_of_code, find_unused_imports (Python only).
+- Format conversion: convert_file_format (json<->yaml, json<->csv), minify_file
+  (json/css/js).
 - Images: Image_Fetch (look at an image already in the workspace and answer a
   question about it, or describe it — use this to verify a generated image,
   read text/diagrams in a screenshot, etc.), Image_Create (generate a new
@@ -63,6 +67,9 @@ Important rules:
   find_file instead of "run_command('find . -name ...')", use git_status/git_commit
   instead of raw git shell commands, use git_clone instead of "run_command('git clone
   ...')", use replace_in_files instead of manually editing each file one by one).
+- For replace_in_files, use dry_run=True first on any broad or risky rename to see
+  what would change before actually applying it, and use whole_word=True when
+  renaming a variable/identifier (so "name" doesn't also match inside "username").
 - After using Image_Create, you can optionally use Image_Fetch on the result if you
   need to verify what was actually generated (e.g. to check it matches the request)
   before telling the user it's done.
@@ -191,6 +198,36 @@ class GeminiAgent:
 
         return response
 
+    def _trim_history(self):
+        """
+        Trims self.history down to config.MAX_HISTORY_MESSAGES entries when
+        it grows too large — but unlike a naive slice, this respects
+        function_call/function_response pairing. Each tool call adds at
+        least two Content entries (the model's turn requesting the call,
+        then our "tool" role turn with the result); cutting the history
+        list at an arbitrary boundary can leave a dangling function_response
+        with no preceding function_call (or vice versa), which the Gemini
+        API can reject or mishandle on the next turn. To avoid that, we only
+        ever trim starting from a "user" role turn — the natural start of a
+        complete conversational exchange — so a trimmed history always
+        begins with a clean, self-contained turn.
+        """
+        if len(self.history) <= config.MAX_HISTORY_MESSAGES:
+            return
+
+        # Walk backwards from the count-based cutoff to find the nearest
+        # preceding "user" turn, so the kept history starts cleanly there
+        # rather than mid-way through a tool-call exchange.
+        cutoff = len(self.history) - config.MAX_HISTORY_MESSAGES
+        for i in range(cutoff, len(self.history)):
+            if self.history[i].role == "user":
+                self.history = self.history[i:]
+                return
+        # No "user" turn found in the range being trimmed (unlikely, but
+        # possible if a single exchange used more tool calls than
+        # MAX_HISTORY_MESSAGES) — fall back to keeping everything rather
+        # than risk cutting a function_call/function_response pair apart.
+
     # ---------------- main entrypoint: send a message (non-streaming) ----------------
     def send(self, user_message: str) -> str:
         self.memory.log_message("user", user_message)
@@ -212,8 +249,7 @@ class GeminiAgent:
         )
         self.history.append(types.Content(role="model", parts=[types.Part(text=reply_text)]))
 
-        if len(self.history) > config.MAX_HISTORY_MESSAGES:
-            self.history = self.history[-config.MAX_HISTORY_MESSAGES:]
+        self._trim_history()
 
         return reply_text
 
@@ -301,8 +337,7 @@ class GeminiAgent:
         )
         self.history.append(types.Content(role="model", parts=[types.Part(text=reply_text)]))
 
-        if len(self.history) > config.MAX_HISTORY_MESSAGES:
-            self.history = self.history[-config.MAX_HISTORY_MESSAGES:]
+        self._trim_history()
 
     # ---------------- manual long-term memory management ----------------
     def remember(self, key: str, value: str, category: str = "general"):

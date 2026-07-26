@@ -1357,7 +1357,14 @@ def count_files(extension: str = None) -> str:
     return "\n".join(lines)
 
 
-def replace_in_files(old_text: str, new_text: str, extensions: List[str] = None) -> str:
+def replace_in_files(
+    old_text: str,
+    new_text: str,
+    extensions: List[str] = None,
+    whole_word: bool = False,
+    case_insensitive: bool = False,
+    dry_run: bool = False,
+) -> str:
     """
     Replaces every occurrence of old_text with new_text across all matching
     files in the workspace (e.g. renaming a variable/function project-wide).
@@ -1366,14 +1373,33 @@ def replace_in_files(old_text: str, new_text: str, extensions: List[str] = None)
     undo_last_change() repeatedly to revert all of them).
 
     Args:
-        old_text: the exact text to find and replace
+        old_text: the text to find and replace
         new_text: the replacement text
         extensions: optional list of extensions to restrict the operation
             (e.g. [".py", ".js"]) — strongly recommended for safety on
             broad replacements
+        whole_word: if True, only replaces old_text when it appears as a
+            whole word (not part of a longer word) — e.g. with
+            whole_word=True, replacing "name" won't touch "namespace" or
+            "username". Recommended for renaming variables/identifiers.
+        case_insensitive: if True, matches "Name", "NAME", "name", etc. all
+            the same way — note new_text is still inserted exactly as given
+            (it does not try to preserve the original casing per match).
+        dry_run: if True, shows which files/lines WOULD change (with a
+            preview) without actually writing anything — use this first on
+            any broad or risky replacement to confirm the scope before
+            committing to it.
     """
+    flags = re.IGNORECASE if case_insensitive else 0
+    if whole_word:
+        pattern = re.compile(r"\b" + re.escape(old_text) + r"\b", flags)
+    else:
+        pattern = re.compile(re.escape(old_text), flags)
+
     patterns = _load_ignore_patterns()
     changed_files = []
+    preview_lines = []
+
     for p in config.WORKSPACE_DIR.rglob("*"):
         if not p.is_file():
             continue
@@ -1386,19 +1412,51 @@ def replace_in_files(old_text: str, new_text: str, extensions: List[str] = None)
             content = p.read_text(encoding="utf-8", errors="ignore")
         except Exception:
             continue
-        if old_text not in content:
+
+        matches = list(pattern.finditer(content))
+        if not matches:
+            continue
+
+        if dry_run:
+            lines = content.splitlines()
+            line_starts = []
+            offset = 0
+            for line in lines:
+                line_starts.append(offset)
+                offset += len(line) + 1
+            matched_line_numbers = set()
+            for m in matches:
+                for i, start in enumerate(line_starts):
+                    if start > m.start():
+                        break
+                    line_no = i
+                matched_line_numbers.add(line_no + 1)
+            preview_lines.append(f"📄 {rel} ({len(matches)} match(es)):")
+            for line_no in sorted(matched_line_numbers)[:10]:
+                preview_lines.append(f"  line {line_no}: {lines[line_no - 1].strip()}")
+            if len(matched_line_numbers) > 10:
+                preview_lines.append(f"  ... and {len(matched_line_numbers) - 10} more line(s)")
             continue
 
         _notify("editing", str(rel))
-        count = content.count(old_text)
+        count = len(matches)
         _record_undo("edit", str(rel), content, existed=True)
-        new_content = content.replace(old_text, new_text)
+        new_content = pattern.sub(lambda m: new_text, content)
         p.write_text(new_content, encoding="utf-8")
         _notify("edited", str(rel))
         changed_files.append(f"  {rel} ({count} replacement(s))")
 
+    if dry_run:
+        if not preview_lines:
+            return "ℹ️ No occurrences of the given text were found in any matching file (dry run — nothing would change)."
+        return (
+            f"🔍 DRY RUN — no files were modified. This is what would change:\n\n"
+            + "\n".join(preview_lines)
+            + "\n\nRe-run with dry_run=False to actually apply these changes."
+        )
+
     if not changed_files:
-        return f"ℹ️ No occurrences of the given text were found in any matching file."
+        return "ℹ️ No occurrences of the given text were found in any matching file."
     return f"✅ Replaced text in {len(changed_files)} file(s):\n" + "\n".join(changed_files)
 
 
@@ -2336,6 +2394,292 @@ def check_port_in_use(port: int) -> str:
     return f"🟢 Port {port} is free."
 
 
+def count_lines_of_code() -> str:
+    """
+    Counts lines of code in the workspace, broken down by language/extension,
+    distinguishing blank lines and comment-only lines from actual code lines
+    where practical. Respects .agentignore plus sensible defaults. Gives a
+    quick sense of project size beyond just a file count.
+    """
+    patterns = _load_ignore_patterns()
+    # Extensions we know a single-line-comment prefix for, so we can roughly
+    # separate comments from code. Anything else is just counted as
+    # "lines" without the code/comment/blank breakdown.
+    comment_prefixes = {
+        ".py": "#", ".sh": "#", ".rb": "#", ".yaml": "#", ".yml": "#",
+        ".js": "//", ".jsx": "//", ".ts": "//", ".tsx": "//", ".java": "//",
+        ".c": "//", ".cpp": "//", ".h": "//", ".hpp": "//", ".cs": "//",
+        ".go": "//", ".rs": "//", ".swift": "//", ".kt": "//",
+    }
+
+    stats_by_ext: dict = {}
+    for p in config.WORKSPACE_DIR.rglob("*"):
+        if not p.is_file():
+            continue
+        rel = p.relative_to(config.WORKSPACE_DIR)
+        if _is_ignored(rel, patterns):
+            continue
+        ext = p.suffix.lower() or "(no extension)"
+        try:
+            lines = p.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except Exception:
+            continue
+
+        entry = stats_by_ext.setdefault(ext, {"files": 0, "total": 0, "blank": 0, "comment": 0, "code": 0})
+        entry["files"] += 1
+        prefix = comment_prefixes.get(ext)
+        for line in lines:
+            stripped = line.strip()
+            entry["total"] += 1
+            if not stripped:
+                entry["blank"] += 1
+            elif prefix and stripped.startswith(prefix):
+                entry["comment"] += 1
+            else:
+                entry["code"] += 1
+
+    if not stats_by_ext:
+        return "No files found in the workspace."
+
+    lines_out = ["📊 Lines of code by extension:\n"]
+    total_all = {"files": 0, "total": 0, "blank": 0, "comment": 0, "code": 0}
+    for ext, s in sorted(stats_by_ext.items(), key=lambda x: -x[1]["total"]):
+        for k in total_all:
+            total_all[k] += s[k]
+        lines_out.append(
+            f"  {ext}: {s['files']} file(s), {s['total']} lines "
+            f"({s['code']} code, {s['comment']} comment, {s['blank']} blank)"
+        )
+    lines_out.append(
+        f"\nTotal: {total_all['files']} file(s), {total_all['total']} lines "
+        f"({total_all['code']} code, {total_all['comment']} comment, {total_all['blank']} blank)"
+    )
+    return "\n".join(lines_out)
+
+
+def http_request(url: str, method: str = "GET", headers: dict = None, body: str = None, timeout: int = 15) -> str:
+    """
+    Sends an HTTP request (GET/POST/PUT/DELETE/etc.) and returns the status
+    code, response headers, and body. Useful for testing a local API you're
+    building (e.g. http://localhost:3000/api/users) or checking a request
+    against any reachable URL. Response body is truncated if very large.
+
+    Args:
+        url: the URL to request (e.g. "http://localhost:8000/api/health")
+        method: HTTP method (default "GET")
+        headers: optional dict of request headers (e.g. {"Content-Type": "application/json"})
+        body: optional request body as a string (e.g. a JSON payload already serialized)
+        timeout: request timeout in seconds (default 15)
+    """
+    import urllib.request
+    import urllib.error
+
+    req = urllib.request.Request(url, method=method.upper(), headers=headers or {})
+    if body is not None:
+        req.data = body.encode("utf-8")
+
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            status = resp.status
+            resp_headers = dict(resp.getheaders())
+            resp_body = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as e:
+        status = e.code
+        resp_headers = dict(e.headers or {})
+        resp_body = e.read().decode("utf-8", errors="replace") if e.fp else ""
+    except urllib.error.URLError as e:
+        return f"❌ Request failed: {e.reason}"
+    except Exception as e:
+        return f"❌ Request failed: {e}"
+
+    if len(resp_body) > 3000:
+        resp_body = resp_body[:3000] + f"\n... (truncated, {len(resp_body)} total chars)"
+
+    header_lines = "\n".join(f"  {k}: {v}" for k, v in resp_headers.items())
+    return (
+        f"$ {method.upper()} {url}\n"
+        f"Status: {status}\n"
+        f"Headers:\n{header_lines}\n\n"
+        f"Body:\n{resp_body}"
+    )
+
+
+def find_unused_imports(path: str) -> str:
+    """
+    Scans a Python file for imports that appear to be unused (imported but
+    never referenced elsewhere in the file). Uses simple name-usage
+    counting via the ast module — not a full type-aware analysis, so it can
+    have false positives/negatives for dynamic usage (e.g. `__all__`,
+    string-based references, re-exports), but catches the common case
+    reliably.
+
+    Args:
+        path: relative path of the Python file to check
+    """
+    p = _safe_path(path)
+    if not p.exists():
+        return f"❌ File not found: {path}"
+    if p.suffix.lower() != ".py":
+        return f"❌ find_unused_imports only supports Python (.py) files, got: {p.suffix}"
+
+    import ast
+    try:
+        source = p.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+    except SyntaxError as e:
+        return f"❌ Could not parse {path} (syntax error): {e}"
+
+    imported_names = {}  # name -> line number
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                name = alias.asname or alias.name.split(".")[0]
+                imported_names[name] = node.lineno
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                if alias.name == "*":
+                    continue  # can't reliably track star-imports
+                name = alias.asname or alias.name
+                imported_names[name] = node.lineno
+
+    if not imported_names:
+        return f"ℹ️ No imports found in {path}."
+
+    # Count all Name/Attribute usages in the file, excluding the import
+    # statements themselves, to see which imported names are referenced.
+    used_names = set()
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        if isinstance(node, ast.Name):
+            used_names.add(node.id)
+        elif isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            used_names.add(node.value.id)
+
+    # Also check for __all__ exports and plain string mentions (best-effort
+    # coverage for re-export patterns without full false-negative safety).
+    # Also give __all__ exports a pass (a name listed there is being
+    # "used" as a public re-export even if never referenced elsewhere).
+    all_export_names = set()
+    if "__all__" in source:
+        try:
+            all_export_names = set(ast.literal_eval(source.split("__all__", 1)[1].split("=", 1)[1].split("\n")[0].strip().rstrip(",")))
+        except Exception:
+            pass  # if __all__ isn't a simple literal list, just skip this extra check
+
+    unused = []
+    for name, lineno in sorted(imported_names.items(), key=lambda x: x[1]):
+        if name not in used_names and name not in all_export_names:
+            unused.append(f"  line {lineno}: '{name}' appears unused")
+
+    if not unused:
+        return f"✅ No unused imports detected in {path}."
+    return f"⚠️ Possibly unused imports in {path} (double-check before removing — dynamic usage can cause false positives):\n" + "\n".join(unused)
+
+
+def convert_file_format(source_path: str, destination_path: str) -> str:
+    """
+    Converts a data file between common formats based on the source and
+    destination extensions. Supported conversions: .json <-> .yaml/.yml,
+    .json <-> .csv (for a flat list of flat dicts), .csv <-> .json.
+
+    Args:
+        source_path: relative path of the file to convert
+        destination_path: relative path for the converted output (its
+            extension determines the target format)
+    """
+    src = _safe_path(source_path)
+    if not src.exists():
+        return f"❌ Source file not found: {source_path}"
+
+    src_ext = src.suffix.lower()
+    dst_ext = Path(destination_path).suffix.lower()
+
+    try:
+        if src_ext == ".json" and dst_ext in (".yaml", ".yml"):
+            import yaml
+            data = json.loads(src.read_text(encoding="utf-8"))
+            output = yaml.dump(data, allow_unicode=True, sort_keys=False)
+        elif src_ext in (".yaml", ".yml") and dst_ext == ".json":
+            import yaml
+            data = yaml.safe_load(src.read_text(encoding="utf-8"))
+            output = json.dumps(data, ensure_ascii=False, indent=2)
+        elif src_ext == ".json" and dst_ext == ".csv":
+            import csv
+            import io
+            data = json.loads(src.read_text(encoding="utf-8"))
+            if not isinstance(data, list) or not data or not isinstance(data[0], dict):
+                return "❌ .json -> .csv conversion requires a JSON array of flat objects (e.g. [{\"a\": 1, \"b\": 2}, ...])."
+            buf = io.StringIO()
+            writer = csv.DictWriter(buf, fieldnames=list(data[0].keys()))
+            writer.writeheader()
+            writer.writerows(data)
+            output = buf.getvalue()
+        elif src_ext == ".csv" and dst_ext == ".json":
+            import csv
+            import io
+            reader = csv.DictReader(io.StringIO(src.read_text(encoding="utf-8")))
+            output = json.dumps(list(reader), ensure_ascii=False, indent=2)
+        else:
+            return f"❌ Unsupported conversion: {src_ext} -> {dst_ext}. Supported: json<->yaml, json<->csv."
+    except ImportError:
+        return "❌ The 'pyyaml' package is required for YAML conversion — install it with add_dependency('pyyaml')."
+    except Exception as e:
+        return f"❌ Conversion failed: {e}"
+
+    return create_file(destination_path, output)
+
+
+def minify_file(path: str, output_path: str = None) -> str:
+    """
+    Minifies a JSON, CSS, or JS file (removes unnecessary whitespace/
+    comments) to reduce size. For JS, this is a simple whitespace/comment
+    stripper, not a full minifier — good enough for basic size reduction,
+    not for advanced optimizations (variable renaming, dead code elimination).
+
+    Args:
+        path: relative path of the file to minify
+        output_path: optional path to save the minified version to — if
+            omitted, overwrites the original file (previous content is
+            snapshotted first, so this can be undone)
+    """
+    p = _safe_path(path)
+    if not p.exists():
+        return f"❌ File not found: {path}"
+
+    ext = p.suffix.lower()
+    content = p.read_text(encoding="utf-8")
+
+    if ext == ".json":
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError as e:
+            return f"❌ Invalid JSON, cannot minify: {e}"
+        minified = json.dumps(data, separators=(",", ":"), ensure_ascii=False)
+
+    elif ext == ".css":
+        # Strip /* comments */, collapse whitespace, remove space around
+        # punctuation — a simple but effective CSS minifier.
+        minified = re.sub(r"/\*.*?\*/", "", content, flags=re.DOTALL)
+        minified = re.sub(r"\s+", " ", minified)
+        minified = re.sub(r"\s*([{}:;,])\s*", r"\1", minified)
+        minified = minified.strip()
+
+    elif ext in (".js", ".jsx"):
+        # Best-effort: strip // and /* */ comments and collapse blank lines.
+        # Does NOT touch strings/regex containing "//" perfectly — good
+        # enough for simple scripts, not safe for complex minification.
+        minified = re.sub(r"/\*.*?\*/", "", content, flags=re.DOTALL)
+        lines = [l for l in minified.splitlines() if l.strip() and not l.strip().startswith("//")]
+        minified = "\n".join(lines)
+
+    else:
+        return f"❌ minify_file only supports .json, .css, .js/.jsx files, got: {ext}"
+
+    target = output_path or path
+    return create_file(target, minified)
+
+
 # List of all available tools (passed to the model via function calling)
 ALL_TOOLS = [
     create_file,
@@ -2384,5 +2728,10 @@ ALL_TOOLS = [
     load_checkpoint,
     list_checkpoints,
     check_port_in_use,
+    count_lines_of_code,
+    http_request,
+    find_unused_imports,
+    convert_file_format,
+    minify_file,
     undo_last_change,
 ]

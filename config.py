@@ -2,12 +2,48 @@
 General Agent configuration.
 """
 import os
+import sys
 from pathlib import Path
 
+
+def _get_persistent_base_dir() -> Path:
+    """
+    Returns a directory to store persistent app data (API key, memory,
+    execution log, usage stats) that works correctly whether running as a
+    normal Python script OR as a PyInstaller-frozen executable.
+
+    Why not just Path(__file__).parent? Under PyInstaller — especially
+    --onefile mode — the running program is unpacked into a TEMPORARY
+    directory each time it starts (sys._MEIPASS), which is deleted again on
+    exit. Using that location for persistent data (the saved API key,
+    conversation memory, etc.) would silently lose everything between runs,
+    which defeats the entire point of this app's persistent-memory feature.
+
+    Instead: if AGENT_DATA_DIR is set, honor it explicitly. Otherwise, use a
+    dedicated folder next to the actual executable/script (sys.executable
+    when frozen, since that path IS persistent — it's the .exe/binary
+    itself, not a temp extraction — or the script's own directory
+    otherwise). This keeps the "everything lives next to the program"
+    simplicity of the original design while being safe under PyInstaller.
+    """
+    env_override = os.environ.get("AGENT_DATA_DIR")
+    if env_override:
+        return Path(env_override)
+
+    if getattr(sys, "frozen", False):
+        # Running as a PyInstaller-frozen executable: sys.executable points
+        # at the actual persistent .exe/binary location (not the temporary
+        # extraction dir), so store data next to that.
+        return Path(sys.executable).parent
+
+    # Normal `python cli.py` execution — behave as before, next to the source.
+    return Path(__file__).parent
+
+
 # ---------- Base paths ----------
-BASE_DIR = Path(__file__).parent
+BASE_DIR = _get_persistent_base_dir()
 MEMORY_DIR = BASE_DIR / "memory_store"
-MEMORY_DIR.mkdir(exist_ok=True)
+MEMORY_DIR.mkdir(parents=True, exist_ok=True)
 
 # Local file used to persist the API key (instead of environment variables)
 API_KEY_FILE = BASE_DIR / ".gemini_api_key"
@@ -79,7 +115,7 @@ MODEL_CHAIN = [
     },
     {
         "name": "gemini-2.5-flash-lite",
-        "max_requests_per_session": 302,
+        "max_requests_per_session": 300,
     },
     {
         "name": "gemini-2.5-pro",
