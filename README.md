@@ -209,6 +209,6 @@ app's own code could both try to invoke the same tool.
 This is a best-effort sandboxing layer for a personal coding assistant, not a
 hardened multi-tenant security boundary — don't point it at anything you
 don't trust the model to have full read/write access to within the workspace.
-
+## Powered by [Anthropic Claude](https://claude.ai)
 ## License
 Please read license 
