@@ -48,7 +48,7 @@ framework dependencies.
 ## Installation
 
 ```bash
-git clone <this-repo-url>
+git clone https://github.com/MhX2780/UGA.git
 cd gemini_agent
 pip install -r requirements.txt
 python3 cli.py
@@ -211,5 +211,4 @@ hardened multi-tenant security boundary — don't point it at anything you
 don't trust the model to have full read/write access to within the workspace.
 
 ## License
-
-No license specified — add one appropriate for your use case.
+Please read license 
