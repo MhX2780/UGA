@@ -79,7 +79,7 @@ MODEL_CHAIN = [
     },
     {
         "name": "gemini-2.5-flash-lite",
-        "max_requests_per_session": 300,
+        "max_requests_per_session": 302,
     },
     {
         "name": "gemini-2.5-pro",
