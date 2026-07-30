@@ -1891,6 +1891,104 @@ def Image_Fetch(path: str, question: str = "Describe this image in detail.") -> 
         return f"❌ Failed to analyze image(s): {e}"
 
 
+_LAST_SCREENSHOT_PATH = None  # tracks the previous screenshot for frame-differencing
+
+
+def view_screen(question: str = "Describe what's currently on screen.",
+                 only_if_changed: bool = False, change_threshold: float = 2.0) -> str:
+    """
+    Takes a SINGLE screenshot of the user's screen right now and asks the
+    model to describe or answer a question about it. This is
+    EVENT-DRIVEN — it only captures when explicitly called (e.g. because
+    the user asked "what's on my screen" or "did the install finish"), not
+    on any kind of timer or continuous loop. Do not call this repeatedly in
+    a polling loop; call it once per meaningful moment (e.g. right after
+    starting an installer, or when the user asks about the screen).
+
+    Requires a graphical display to be active (works on Windows/macOS
+    natively; on Linux requires an active X11/Wayland session — headless
+    servers/containers without a display will get a clear error, not a
+    crash).
+
+    Args:
+        question: what to ask about the screen (default: general description)
+        only_if_changed: if True, compares this screenshot to the last one
+            taken via view_screen and returns early (without spending an API
+            call) if the screen looks essentially unchanged — see
+            change_threshold. Useful for "let me know when this finishes"
+            style follow-ups without wasting requests on an unchanged
+            screen. Default False (always analyze).
+        change_threshold: how different (0-100, percentage of differing
+            pixels) the new screenshot must be from the last one to count as
+            "changed" when only_if_changed=True. Default 2.0 (small UI
+            changes like a blinking cursor won't trigger it; a new window or
+            dialog will).
+    """
+    global _LAST_SCREENSHOT_PATH
+    try:
+        from PIL import Image, ImageGrab, ImageChops
+    except ImportError:
+        return "❌ Screen viewing requires the 'Pillow' package (pip install Pillow)."
+
+    _notify("running", "capturing screen")
+    try:
+        screenshot = ImageGrab.grab()
+    except Exception as e:
+        _notify("ran", "capturing screen")
+        return (
+            f"❌ Could not capture the screen: {e}. This usually means no "
+            f"graphical display is available (e.g. running headless/over SSH "
+            f"without X11 forwarding)."
+        )
+    _notify("ran", "capturing screen")
+
+    screenshots_dir = config.WORKSPACE_DIR / ".undo_history" / "screenshots"
+    screenshots_dir.mkdir(parents=True, exist_ok=True)
+    new_path = screenshots_dir / f"screen_{int(time.time() * 1000)}.png"
+    screenshot.save(new_path, "PNG")
+
+    if only_if_changed and _LAST_SCREENSHOT_PATH and _LAST_SCREENSHOT_PATH.exists():
+        try:
+            from PIL import ImageStat
+            previous = Image.open(_LAST_SCREENSHOT_PATH).convert("RGB")
+            current = screenshot.convert("RGB")
+            if previous.size == current.size:
+                # Percentage of pixels that changed meaningfully between the
+                # two screenshots: take the per-pixel difference, threshold
+                # it into a binary changed/unchanged mask, then the mean of
+                # that binary mask directly gives the changed-pixel
+                # percentage (0=none changed, 255=all changed -> /255*100).
+                diff_gray = ImageChops.difference(previous, current).convert("L")
+                binary_mask = diff_gray.point(lambda p: 255 if p > 10 else 0)
+                changed_pct = ImageStat.Stat(binary_mask).mean[0] / 255.0 * 100.0
+
+                if changed_pct < change_threshold:
+                    _LAST_SCREENSHOT_PATH = new_path
+                    return (
+                        f"ℹ️ Screen looks essentially unchanged since the last check "
+                        f"(~{changed_pct:.1f}% of pixels differ, threshold {change_threshold}%) "
+                        f"— skipped analysis to save a request. Call again with "
+                        f"only_if_changed=False to force analysis anyway."
+                    )
+        except Exception:
+            pass  # if diffing fails for any reason, just fall through to a normal analysis
+
+    _LAST_SCREENSHOT_PATH = new_path
+
+    try:
+        from google.genai import types
+        client = _get_image_client()
+        response = client.models.generate_content(
+            model=IMAGE_UNDERSTANDING_MODEL,
+            contents=[question, types.Part.from_bytes(data=new_path.read_bytes(), mime_type="image/png")],
+        )
+        return response.text or "(The model didn't return a description.)"
+    except RuntimeError as e:
+        return f"❌ {e}"
+    except Exception as e:
+        return f"❌ Failed to analyze the screenshot: {e}"
+
+
 def Image_Create(prompt: str, output_path: str, aspect_ratio: str = "1:1") -> str:
     """
     Generates an image from a text description using Gemini's built-in
@@ -2680,6 +2778,91 @@ def minify_file(path: str, output_path: str = None) -> str:
     return create_file(target, minified)
 
 
+def git_fetcher(repo: str, include_tree: bool = True) -> str:
+    """
+    Fetches metadata about a GitHub repository WITHOUT cloning it — repo
+    description, star/fork/watcher counts, license, primary language,
+    open issues count, default branch, last push date, and (optionally) the
+    top-level file tree. Much faster than git_clone when you just need to
+    understand what a repo is/contains before deciding whether to clone it.
+
+    Works via GitHub's public REST API, no authentication required for
+    public repositories (subject to GitHub's unauthenticated rate limit —
+    60 requests/hour per IP). Only public repos are accessible without a
+    connected GitHub account.
+
+    Args:
+        repo: repository in "owner/name" form (e.g. "octocat/Hello-World"),
+            or a full GitHub URL (e.g. "https://github.com/octocat/Hello-World")
+        include_tree: whether to also fetch and show the top-level file/
+            folder listing (default True) — set False for a faster,
+            metadata-only lookup
+    """
+    # Accept either "owner/repo" or a full github.com URL.
+    match = re.search(r"github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$", repo)
+    if match:
+        owner, name = match.group(1), match.group(2)
+    elif "/" in repo and not repo.startswith("http"):
+        owner, name = repo.split("/", 1)
+    else:
+        return f"❌ Could not parse '{repo}' as a GitHub repo — use 'owner/name' or a full github.com URL."
+
+    api_base = f"https://api.github.com/repos/{owner}/{name}"
+    meta_result = http_request(api_base)
+    if meta_result.startswith("❌"):
+        return meta_result
+
+    # http_request returns a formatted "$ GET ...\nStatus: N\nHeaders:...\n\nBody:\n{...}"
+    # string (built for human/model reading) — extract the JSON body back out.
+    body_marker = "\n\nBody:\n"
+    if body_marker not in meta_result:
+        return f"❌ Unexpected response format fetching {owner}/{name}."
+    raw_body = meta_result.split(body_marker, 1)[1]
+
+    try:
+        data = json.loads(raw_body)
+    except json.JSONDecodeError:
+        return f"❌ Could not parse GitHub's response for {owner}/{name} (it may not exist, or you hit GitHub's rate limit)."
+
+    if data.get("message") == "Not Found":
+        return f"❌ Repository '{owner}/{name}' not found (private, or doesn't exist)."
+    if "API rate limit exceeded" in str(data.get("message", "")):
+        return f"❌ GitHub API rate limit exceeded for this IP. Try again later, or use git_clone directly instead."
+
+    license_name = (data.get("license") or {}).get("name", "None")
+    lines = [
+        f"📦 {data.get('full_name', f'{owner}/{name}')}",
+        f"Description: {data.get('description') or '(none)'}",
+        f"⭐ Stars: {data.get('stargazers_count', 0)}  "
+        f"🍴 Forks: {data.get('forks_count', 0)}  "
+        f"👁 Watchers: {data.get('watchers_count', 0)}  "
+        f"🐛 Open issues: {data.get('open_issues_count', 0)}",
+        f"License: {license_name}",
+        f"Primary language: {data.get('language') or '(unknown)'}",
+        f"Default branch: {data.get('default_branch', 'main')}",
+        f"Last push: {data.get('pushed_at', 'unknown')}",
+        f"Archived: {data.get('archived', False)}",
+        f"URL: {data.get('html_url', f'https://github.com/{owner}/{name}')}",
+    ]
+
+    if include_tree:
+        branch = data.get("default_branch", "main")
+        tree_result = http_request(f"{api_base}/contents/")
+        if not tree_result.startswith("❌") and body_marker in tree_result:
+            try:
+                tree_body = tree_result.split(body_marker, 1)[1]
+                entries = json.loads(tree_body)
+                if isinstance(entries, list):
+                    lines.append("\nTop-level contents:")
+                    for entry in sorted(entries, key=lambda e: (e.get("type") != "dir", e.get("name", ""))):
+                        icon = "📁" if entry.get("type") == "dir" else "📄"
+                        lines.append(f"  {icon} {entry.get('name')}")
+            except (json.JSONDecodeError, KeyError):
+                lines.append("\n(Could not fetch file tree)")
+
+    return "\n".join(lines)
+
+
 # List of all available tools (passed to the model via function calling)
 ALL_TOOLS = [
     create_file,
@@ -2707,6 +2890,7 @@ ALL_TOOLS = [
     read_background_log,
     stop_background_process,
     git_clone,
+    git_fetcher,
     git_diff,
     git_status,
     git_log,
@@ -2718,6 +2902,7 @@ ALL_TOOLS = [
     env_var_check,
     Image_Fetch,
     Image_Create,
+    view_screen,
     list_dependencies,
     add_dependency,
     run_tests,

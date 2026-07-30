@@ -578,6 +578,20 @@ def main():
             if not entries:
                 print(f"{C.DIM}ℹ️  No actions taken yet this session.{C.RESET}")
             else:
+                # draw_box sizes the box to the terminal width and wraps
+                # each line inside "│ " + content + " │" — so the actual
+                # budget for arbitrary content (tool args, result text) has
+                # to account for everything else already on that line
+                # (timestamp, status icon, tool name, parens) too, not just
+                # be some arbitrary flat number. Using a fixed length here
+                # without that accounting was the actual bug: the fixed
+                # truncation point was too generous once the tool
+                # name/timestamp/etc. were added back on top of it, so the
+                # combined line still overflowed the box width.
+                from colors import term_width
+                box_inner_width = term_width() - 4  # matches draw_box's own inner-width math
+                MAX_RESULT_LINE_LEN = max(20, box_inner_width - 20)  # reserve ~20 cols for the prefix
+
                 lines = []
                 for e in entries:
                     import time as _time
@@ -585,11 +599,21 @@ def main():
                     status_color = C.GREEN if e["success"] else C.RED
                     status_icon = "✓" if e["success"] else "✗"
                     args_str = ", ".join(f"{k}={v}" for k, v in e.get("args", {}).items())
+                    # Budget for args_str: box width minus space already used
+                    # by "[HH:MM:SS] ✓ tool_name(" and the closing ")".
+                    prefix_len = len(f"[{when}] {status_icon} {e['tool']}(")
+                    args_budget = max(10, box_inner_width - prefix_len - 1)
+                    if len(args_str) > args_budget:
+                        args_str = args_str[:args_budget - 3] + "..."
                     lines.append(
                         f"{C.DIM}[{when}]{C.RESET} {status_color}{status_icon}{C.RESET} "
                         f"{C.CYAN}{e['tool']}{C.RESET}({args_str})"
                     )
-                    lines.append(f"    {C.DIM}→ {e['result']}{C.RESET}")
+                    result_str = str(e["result"]).replace("\n", " ")
+                    result_budget = max(10, box_inner_width - 6)  # "    → " prefix is 6 chars
+                    if len(result_str) > result_budget:
+                        result_str = result_str[:result_budget - 3] + "..."
+                    lines.append(f"    {C.DIM}→ {result_str}{C.RESET}")
                 print(draw_box("Execution log", lines, color=C.ORANGE))
             continue
 
