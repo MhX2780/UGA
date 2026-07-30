@@ -27,6 +27,43 @@ import config
 from colors import C
 
 
+def fetch_available_models(api_key: str) -> list:
+    """
+    Queries the Gemini API directly for every model this specific API key
+    actually has access to, filtered down to ones that support text
+    generation (generateContent) — i.e. usable by this agent's chat/tool-
+    calling flow. This is deliberately used instead of a hardcoded model
+    list, since which models exist (and which are free) changes often
+    enough that a hardcoded "correct" list goes stale — /settings uses this
+    to show the real, current, key-specific list.
+
+    Returns a list of dicts: [{"name": "gemini-3.6-flash",
+    "display_name": "Gemini 3.6 Flash", "input_token_limit": ...,
+    "output_token_limit": ...}, ...]. Raises the underlying exception on
+    network/auth failure — callers should catch and show a clear message
+    rather than let /settings crash on a bad key or offline connection.
+    """
+    client = genai.Client(api_key=api_key)
+    models = []
+    for m in client.models.list():
+        actions = m.supported_actions or []
+        if "generateContent" not in actions:
+            continue  # skip embedding-only, image-generation-only, etc. models
+        # Model names come back as "models/gemini-3.6-flash" — strip the
+        # "models/" prefix since that's not part of the name used elsewhere
+        # in this codebase (MODEL_CHAIN entries, generate_content calls, etc.)
+        name = m.name.split("/", 1)[-1] if m.name else None
+        if not name:
+            continue
+        models.append({
+            "name": name,
+            "display_name": m.display_name or name,
+            "input_token_limit": m.input_token_limit,
+            "output_token_limit": m.output_token_limit,
+        })
+    return models
+
+
 class ModelRouter:
     def __init__(self, api_key: str):
         self.client = genai.Client(api_key=api_key)
@@ -224,6 +261,103 @@ class ModelRouter:
             wait = config.RETRY_BACKOFF_BASE
             self._report_status(f"{C.BLUE}{model_name}: {short_reason}{C.RESET}")
             return "retry", wait
+
+    # ---------- direct call to a SPECIFIC model (for multi-agent roles) ----------
+    def generate_with_model(self, model_name: str, contents, system_instruction: Optional[str] = None,
+                             tools: Optional[list] = None) -> Any:
+        """
+        Sends a request to a SPECIFIC named model (used by the multi-agent
+        feature, where each role — classifier/planner/executor/reviewer —
+        has its own assigned model rather than using the shared
+        chain-switching logic in generate()). Still gets the same retry
+        handling for transient errors (rate limits, server errors) as
+        generate(), but does NOT permanently advance self.current_index —
+        multi-agent roles are independent of whichever model the main
+        single-agent chain is currently on.
+
+        If the specific model fails even after retries (e.g. genuinely no
+        quota on this plan for it), falls back to running the SAME request
+        through the normal generate() chain instead of failing outright —
+        so a misconfigured or currently-unavailable role model degrades
+        gracefully rather than breaking multi-agent mode entirely.
+        """
+        gen_config = self._build_config(system_instruction, tools)
+        attempts = 0
+        last_error = None
+
+        while attempts < config.RETRIES_PER_MODEL:
+            attempts += 1
+            try:
+                response = self.client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=gen_config,
+                )
+                self.request_counts.setdefault(model_name, 0)
+                self.request_counts[model_name] += 1
+                self._bump_stat(model_name, "success")
+                return response
+            except Exception as e:
+                last_error = e
+                action, wait = self._classify_error(model_name, e)
+                if action == "retry" and attempts < config.RETRIES_PER_MODEL:
+                    time.sleep(wait)
+                    continue
+                else:
+                    break
+
+        self._report_status(
+            f"{C.BLUE}{model_name} (role model) unavailable, falling back to main chain{C.RESET}"
+        )
+        return self.generate(contents, system_instruction=system_instruction, tools=tools)
+
+    def generate_stream_with_model(self, model_name: str, contents, system_instruction: Optional[str] = None,
+                                    tools: Optional[list] = None) -> Iterator[str]:
+        """
+        Streaming counterpart to generate_with_model() — sends the request to
+        a specific named model (for multi-agent roles) and yields text
+        chunks as they arrive. Falls back to the normal generate_stream()
+        chain if the specific model fails after retries, same reasoning as
+        generate_with_model().
+        """
+        gen_config = self._build_config(system_instruction, tools)
+        attempts = 0
+        last_error = None
+
+        while attempts < config.RETRIES_PER_MODEL:
+            attempts += 1
+            got_any_output = False
+            try:
+                for chunk in self.client.models.generate_content_stream(
+                    model=model_name,
+                    contents=contents,
+                    config=gen_config,
+                ):
+                    chunk_text = getattr(chunk, "text", None)
+                    if chunk_text:
+                        got_any_output = True
+                        yield chunk_text
+                self.request_counts.setdefault(model_name, 0)
+                self.request_counts[model_name] += 1
+                self._bump_stat(model_name, "success")
+                return
+            except Exception as e:
+                last_error = e
+                if got_any_output:
+                    self._bump_stat(model_name, "failure")
+                    raise
+                action, wait = self._classify_error(model_name, e)
+                if action == "retry" and attempts < config.RETRIES_PER_MODEL:
+                    time.sleep(wait)
+                    continue
+                else:
+                    break
+
+        self._report_status(
+            f"{C.BLUE}{model_name} (role model) unavailable, falling back to main chain{C.RESET}"
+        )
+        for chunk in self.generate_stream(contents, system_instruction=system_instruction, tools=tools):
+            yield chunk
 
     # ---------- main entrypoint (non-streaming) ----------
     def generate(self, contents, system_instruction: Optional[str] = None,

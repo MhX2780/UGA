@@ -34,7 +34,10 @@ similar to Gemini CLI. You have a wide set of tools available:
   detect_language, count_files, count_todos, list_files.
 - Bulk editing: replace_in_files (find/replace across many files at once).
 - Code quality: lint_check (single file), check_file_syntax_all (whole project).
-- Git: git_clone, git_status, git_diff, git_log, git_commit.
+- Git: git_clone, git_fetcher, git_status, git_diff, git_log, git_commit.
+  git_fetcher looks up a GitHub repo's metadata (stars, license, description,
+  file tree) WITHOUT cloning it — use it first when the user asks about a
+  repo you haven't cloned yet, before deciding whether git_clone is needed.
 - Execution: run_command, start_background_process, list_background_processes,
   read_background_log, stop_background_process. run_command works on both
   Unix and Windows — common Unix commands (ls, cat, cp, mv, rm, grep, head,
@@ -58,6 +61,14 @@ similar to Gemini CLI. You have a wide set of tools available:
   question about it, or describe it — use this to verify a generated image,
   read text/diagrams in a screenshot, etc.), Image_Create (generate a new
   image from a text description and save it to the workspace).
+- Screen: view_screen takes ONE screenshot of the user's actual screen right
+  now and describes/answers a question about it. This is EVENT-DRIVEN ONLY —
+  call it once when the user asks about their screen or right after an
+  action whose result is visible on screen (e.g. after launching an
+  installer). NEVER call it repeatedly in a loop to "watch" the screen over
+  time — that wastes requests and hits rate limits fast. If you genuinely
+  need to check again later after telling the user to wait, use
+  only_if_changed=True so an unchanged screen doesn't cost an extra request.
 - Safety net: undo_last_change (reverts your most recent file change).
 
 Important rules:
@@ -143,11 +154,30 @@ class GeminiAgent:
             execution_log_context=execution_log_context or "(No actions taken yet this session)",
         )
 
-    def _run_tool_calls(self, response, system_prompt) -> object:
+    def _run_tool_calls(self, response, model_name: Optional[str] = None) -> object:
         """
         Executes any function calls in `response` in a loop, feeding results
         back to the model, until it returns a response with no more function
         calls. Returns that final response (not yet streamed/read as text).
+
+        Critically, the system prompt is rebuilt FRESH before every single
+        round-trip to the model (not passed in once and reused) — this is
+        what keeps the injected execution_log_context accurate as tools
+        actually run. Reusing a stale system prompt built before any tool
+        had executed meant every subsequent round (and especially the model
+        seen right after an automatic model-switch mid-task) still saw
+        "(No actions taken yet this session)" even after several tools had
+        already completed successfully, making it look like nothing had
+        been done yet — which is exactly why a model resuming after a
+        switch would redo work a previous model already finished.
+
+        Args:
+            response: the initial response (already known to have function_calls)
+            model_name: if given, every round-trip in this loop goes to this
+                SPECIFIC model via generate_with_model (used by the
+                multi-agent executor role, which has its own assigned
+                model) instead of the normal auto-switching chain via
+                generate(). Single-agent mode leaves this as None.
         """
         rounds = 0
         while getattr(response, "function_calls", None) and rounds < MAX_TOOL_ROUNDS:
@@ -190,13 +220,30 @@ class GeminiAgent:
                 )
 
             # Ask the model to continue now that it has the tool result(s).
-            response = self.router.generate(
-                contents=self.history,
-                system_instruction=system_prompt,
-                tools=tools.ALL_TOOLS,
-            )
+            # Rebuilt fresh (not reusing the caller's original prompt) so it
+            # reflects everything recorded in execution_log above, including
+            # what just happened in this very round.
+            fresh_system_prompt = self._build_system_prompt()
+            if model_name:
+                response = self.router.generate_with_model(
+                    model_name=model_name,
+                    contents=self.history,
+                    system_instruction=fresh_system_prompt,
+                    tools=tools.ALL_TOOLS,
+                )
+            else:
+                response = self.router.generate(
+                    contents=self.history,
+                    system_instruction=fresh_system_prompt,
+                    tools=tools.ALL_TOOLS,
+                )
 
         return response
+
+    def _run_tool_calls_with_model(self, response, model_name: str) -> object:
+        """Convenience wrapper: same as _run_tool_calls(response, model_name=...),
+        used by multi_agent.py so its call sites read a bit more explicitly."""
+        return self._run_tool_calls(response, model_name=model_name)
 
     def _trim_history(self):
         """
@@ -240,9 +287,7 @@ class GeminiAgent:
             system_instruction=system_prompt,
             tools=tools.ALL_TOOLS,
         )
-        response = self._run_tool_calls(response, system_prompt)
-
-        reply_text = response.text or "(No text reply)"
+        response = self._run_tool_calls(response)
 
         self.memory.log_message(
             "model", reply_text, meta={"model": self.router.current_model_name}
@@ -254,7 +299,8 @@ class GeminiAgent:
         return reply_text
 
     # ---------------- streaming entrypoint: send a message, yield chunks ----------------
-    def send_stream(self, user_message: str, image_paths: Optional[List[str]] = None):
+    def send_stream(self, user_message: str, image_paths: Optional[List[str]] = None,
+                     _skip_multi_agent: bool = False):
         """
         Same as send(), but the final text reply is streamed chunk by chunk.
         Tool calls (if any) still happen as non-streaming round-trips first
@@ -270,11 +316,26 @@ class GeminiAgent:
                 Image_Fetch (which the model calls itself for images already
                 inside the workspace), this is for the user handing images
                 to the model as part of their own message.
+            _skip_multi_agent: internal flag used by MultiAgentOrchestrator
+                itself when it hands a "simple" classified request back to
+                this method, to avoid re-classifying and looping forever.
+                Not meant to be passed by normal callers.
 
         Usage:
             for chunk in agent.send_stream("hello"):
                 print(chunk, end="", flush=True)
         """
+        if config.MULTI_AGENT_ENABLED and not _skip_multi_agent and not image_paths:
+            # Multi-agent mode is on: hand off to the orchestrator, which
+            # yields MultiAgentEvent objects (not plain text chunks) — the
+            # CLI checks config.MULTI_AGENT_ENABLED itself and calls
+            # run_multi_agent_turn() directly in that case rather than
+            # send_stream(), so reaching here with multi-agent enabled
+            # would only happen via a direct send_stream() call bypassing
+            # the CLI's own dispatch — still handled safely by just running
+            # single-agent mode instead of erroring.
+            pass  # fall through to normal single-agent flow below
+
         self.memory.log_message("user", user_message)
 
         user_parts = [types.Part(text=user_message)]
@@ -308,16 +369,23 @@ class GeminiAgent:
         if getattr(response, "function_calls", None):
             # Run all tool-call rounds (non-streaming) until the model has
             # nothing left to call, then stream just the final turn.
-            response = self._run_tool_calls(response, system_prompt)
+            response = self._run_tool_calls(response)
             if getattr(response, "function_calls", None):
                 # Extremely unlikely (would mean we hit MAX_TOOL_ROUNDS) —
                 # fall back to whatever text we have rather than looping forever.
                 full_text_parts.append(response.text or "")
                 yield full_text_parts[-1]
             else:
+                # Rebuilt fresh here too — same reasoning as inside
+                # _run_tool_calls: by this point several tools may have
+                # already run, and the final streamed answer should be
+                # generated with a system prompt that actually reflects
+                # that (fresh execution_log_context), not the one built
+                # before any of this turn's tool calls happened.
+                final_system_prompt = self._build_system_prompt()
                 for chunk_text in self.router.generate_stream(
                     contents=self.history,
-                    system_instruction=system_prompt,
+                    system_instruction=final_system_prompt,
                     tools=tools.ALL_TOOLS,
                 ):
                     full_text_parts.append(chunk_text)
@@ -358,3 +426,20 @@ class GeminiAgent:
         """Wipes the execution log — useful when starting a clearly new task
         so old actions don't clutter context for no reason."""
         self.execution_log.clear()
+
+    # ---------------- multi-agent mode ----------------
+    def run_multi_agent_turn(self, user_message: str):
+        """
+        Runs a user turn through the multi-agent pipeline (classifier ->
+        either the normal single-agent flow for simple requests, or
+        planner -> executor(s) -> reviewer for complex ones). Yields
+        multi_agent.MultiAgentEvent objects for the CLI to render live —
+        see multi_agent.py's module docstring for the event kinds.
+
+        Only used when config.MULTI_AGENT_ENABLED is True (toggled via
+        /settings in the CLI); the CLI checks that flag itself and calls
+        this instead of send_stream() when it's on.
+        """
+        from multi_agent import MultiAgentOrchestrator
+        orchestrator = MultiAgentOrchestrator(self)
+        yield from orchestrator.run_turn(user_message)

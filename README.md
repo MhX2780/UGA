@@ -1,4 +1,4 @@
-# Unofficial Gemini Agent
+# Gemini Agent CLI
 
 A terminal-based AI coding agent powered by the Gemini API — similar in spirit to
 Gemini CLI or Claude Code, built from scratch with a focus on **persistent
@@ -48,7 +48,7 @@ framework dependencies.
 ## Installation
 
 ```bash
-git clone https://github.com/MhX2780/UGA.git
+git clone <this-repo-url>
 cd gemini_agent
 pip install -r requirements.txt
 python3 cli.py
@@ -209,6 +209,7 @@ app's own code could both try to invoke the same tool.
 This is a best-effort sandboxing layer for a personal coding assistant, not a
 hardened multi-tenant security boundary — don't point it at anything you
 don't trust the model to have full read/write access to within the workspace.
-## Powered by [Anthropic Claude](https://claude.ai)
+
 ## License
-Please read license 
+
+No license specified — add one appropriate for your use case.

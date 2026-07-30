@@ -67,6 +67,37 @@ def save_api_key(key: str):
 
 GEMINI_API_KEY = load_saved_api_key()
 
+# ---------- User-editable settings (persisted, overrides the defaults below) ----------
+SETTINGS_FILE = BASE_DIR / "settings.json"
+
+
+def load_settings() -> dict:
+    """
+    Loads user-editable settings from settings.json (created/edited by
+    /settings in the CLI), falling back to {} if it doesn't exist yet or is
+    corrupted. Settings here override the hardcoded defaults further below
+    in this file — e.g. a saved "model_chain" list replaces MODEL_CHAIN, a
+    saved "multi_agent" dict overrides MULTI_AGENT_ROLES/MULTI_AGENT_ENABLED.
+    This lets /settings change behavior without editing this file directly,
+    and survives restarts.
+    """
+    if SETTINGS_FILE.exists():
+        try:
+            import json
+            return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def save_settings(settings: dict):
+    """Persists the given settings dict to settings.json."""
+    import json
+    SETTINGS_FILE.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+_saved_settings = load_settings()
+
 # ---------- Memory paths ----------
 LONG_TERM_MEMORY_FILE = MEMORY_DIR / "long_term_memory.jsonl"   # persistent facts/preferences
 SESSION_LOG_FILE = MEMORY_DIR / "session_log.jsonl"             # raw log of all conversations
@@ -83,20 +114,25 @@ EXECUTION_LOG_CONTEXT_ENTRIES = 15
 # The first entry is preferred; on failure or quota exhaustion the router
 # moves to the next one.
 #
-# Verified against Google's official Gemini API pricing page
-# (https://ai.google.dev/gemini-api/docs/pricing) as of July 2026:
-#   - gemini-2.0-flash and gemini-2.0-flash-lite were shut down June 1, 2026
-#     and now return errors for all requests — excluded here.
-#   - "gemini-3.5-flash-lite" does not exist as a model (there is no
-#     Flash-Lite variant in the 3.5 generation yet) — removed; the closest
-#     equivalent is gemini-3.1-flash-lite.
-#   - gemini-3.1-pro-preview has NO free tier at all (paid-only per the
-#     pricing page) — placed last, only useful once billing is enabled.
-#   - Every other model below is confirmed "Free of charge" for standard
-#     input/output on the free tier as of this writing. Free-tier quotas can
-#     still change without notice, which is exactly what the automatic
-#     model-switching in this agent is designed to handle gracefully.
-MODEL_CHAIN = [
+# IMPORTANT — verified July 2026: as of April 1, 2026, Google removed ALL
+# Pro-tier models (gemini-2.5-pro, gemini-3-pro, gemini-3.1-pro) from the free
+# tier — they are now paid-only. Only Flash and Flash-Lite models retain a
+# free tier (with reduced daily quotas). Pro models are kept in the chain
+# below as the final fallback for paid accounts, but a free-tier account will
+# simply have them skipped automatically (via the zero-quota detection in
+# model_router.py) rather than ever succeeding on them.
+#
+# This list is also just the DEFAULT — it's fully user-editable at runtime
+# via /settings in the CLI, since which models exist and which are free
+# changes often enough that hardcoding a single "correct" list isn't
+# reliable. /settings lets you add/remove/reorder any model name the Gemini
+# API accepts, and assign specific models to specific ROLES (see
+# MULTI_AGENT_ROLES below) for the multi-agent feature.
+_DEFAULT_MODEL_CHAIN = [
+    {
+        "name": "gemini-3.6-flash",
+        "max_requests_per_session": 200,
+    },
     {
         "name": "gemini-3.5-flash",
         "max_requests_per_session": 200,
@@ -110,26 +146,50 @@ MODEL_CHAIN = [
         "max_requests_per_session": 300,
     },
     {
-        "name": "gemini-2.5-flash",
-        "max_requests_per_session": 200,
-    },
-    {
         "name": "gemini-2.5-flash-lite",
         "max_requests_per_session": 300,
     },
     {
+        # Paid-only since April 1, 2026 — kept as a fallback for paid
+        # accounts; skipped automatically on free-tier accounts.
         "name": "gemini-2.5-pro",
         "max_requests_per_session": 100,
     },
     {
-        # Paid-only (no free tier) — last resort, only works if billing is
-        # enabled on the account. Kept as the final fallback for best quality
-        # on paid accounts rather than failing outright once free options
-        # are exhausted.
-        "name": "gemini-3.1-pro-preview",
+        # Paid-only — last resort, highest quality, only works with billing enabled.
+        "name": "gemini-3.1-pro",
         "max_requests_per_session": None,
     },
 ]
+
+# The actual chain used at runtime: the saved override from /settings if one
+# exists, otherwise the built-in default above.
+MODEL_CHAIN = _saved_settings.get("model_chain", _DEFAULT_MODEL_CHAIN)
+
+_DEFAULT_MULTI_AGENT_ROLES = {
+    "classifier": "gemini-2.5-flash-lite",  # fast/cheap: decides simple-vs-complex
+    "planner": "gemini-3.6-flash",          # breaks a complex task into steps
+    "executor": "gemini-3.5-flash",         # runs tools, writes code
+    "reviewer": "gemini-2.5-flash-lite",    # checks the final result
+}
+
+MULTI_AGENT_ROLES = _saved_settings.get("multi_agent_roles", _DEFAULT_MULTI_AGENT_ROLES)
+MULTI_AGENT_ENABLED = _saved_settings.get("multi_agent_enabled", False)
+
+
+def get_current_settings_snapshot() -> dict:
+    """
+    Returns the full current settings as a plain dict — used by /settings in
+    the CLI to display current values and by save_settings() to persist
+    changes. Always includes every known setting key (falling back to
+    defaults for anything not yet customized), so the saved file is
+    self-documenting rather than a sparse diff.
+    """
+    return {
+        "model_chain": MODEL_CHAIN,
+        "multi_agent_roles": MULTI_AGENT_ROLES,
+        "multi_agent_enabled": MULTI_AGENT_ENABLED,
+    }
 
 # Number of retry attempts on the same model before moving to the next one
 RETRIES_PER_MODEL = 2
