@@ -118,9 +118,20 @@ EXECUTION_LOG_CONTEXT_ENTRIES = 15
 # Pro-tier models (gemini-2.5-pro, gemini-3-pro, gemini-3.1-pro) from the free
 # tier — they are now paid-only. Only Flash and Flash-Lite models retain a
 # free tier (with reduced daily quotas). Pro models are kept in the chain
-# below as the final fallback for paid accounts, but a free-tier account will
-# simply have them skipped automatically (via the zero-quota detection in
+# below as fallbacks for paid accounts, but a free-tier account will simply
+# have them skipped automatically (via the zero-quota detection in
 # model_router.py) rather than ever succeeding on them.
+#
+# NOTE: this list now includes every model currently listed under Google AI
+# Studio's free tier (see gemini_models_list.txt), not just general-purpose
+# text/chat models. That means it also includes image-generation models
+# (e.g. "Nano Banana" variants), TTS models, robotics/computer-use models,
+# and Deep Research / Antigravity agent previews. These do NOT behave like
+# plain chat models — e.g. TTS models expect/return audio, image models
+# return images, etc. — so if the agent sends a normal text prompt to one of
+# these and gets back something it can't use, the router should treat that
+# as a failure and move on to the next entry, same as a quota error. Flash /
+# Flash-Lite text models are kept first in priority order for that reason.
 #
 # This list is also just the DEFAULT — it's fully user-editable at runtime
 # via /settings in the CLI, since which models exist and which are free
@@ -129,37 +140,63 @@ EXECUTION_LOG_CONTEXT_ENTRIES = 15
 # API accepts, and assign specific models to specific ROLES (see
 # MULTI_AGENT_ROLES below) for the multi-agent feature.
 _DEFAULT_MODEL_CHAIN = [
-    {
-        "name": "gemini-3.6-flash",
-        "max_requests_per_session": 200,
-    },
-    {
-        "name": "gemini-3.5-flash",
-        "max_requests_per_session": 200,
-    },
-    {
-        "name": "gemini-3-flash-preview",
-        "max_requests_per_session": 200,
-    },
-    {
-        "name": "gemini-3.1-flash-lite",
-        "max_requests_per_session": 300,
-    },
-    {
-        "name": "gemini-2.5-flash-lite",
-        "max_requests_per_session": 300,
-    },
-    {
-        # Paid-only since April 1, 2026 — kept as a fallback for paid
-        # accounts; skipped automatically on free-tier accounts.
-        "name": "gemini-2.5-pro",
-        "max_requests_per_session": 100,
-    },
-    {
-        # Paid-only — last resort, highest quality, only works with billing enabled.
-        "name": "gemini-3.1-pro",
-        "max_requests_per_session": None,
-    },
+    # --- General-purpose text/chat models (preferred first) ---
+    {"name": "gemini-3.6-flash", "max_requests_per_session": 200},
+    {"name": "gemini-3.5-flash", "max_requests_per_session": 200},
+    {"name": "gemini-flash-latest", "max_requests_per_session": 200},
+    {"name": "gemini-3-flash-preview", "max_requests_per_session": 200},
+    {"name": "gemini-2.5-flash", "max_requests_per_session": 200},
+    {"name": "gemini-2.0-flash", "max_requests_per_session": 200},
+    {"name": "gemini-2.0-flash-001", "max_requests_per_session": 200},
+    {"name": "gemini-omni-flash-preview", "max_requests_per_session": 200},
+    {"name": "gemini-3.5-flash-lite", "max_requests_per_session": 300},
+    {"name": "gemini-3.1-flash-lite", "max_requests_per_session": 300},
+    {"name": "gemini-3.1-flash-lite-preview", "max_requests_per_session": 300},
+    {"name": "gemini-flash-lite-latest", "max_requests_per_session": 300},
+    {"name": "gemini-2.5-flash-lite", "max_requests_per_session": 300},
+    {"name": "gemini-2.0-flash-lite", "max_requests_per_session": 300},
+    {"name": "gemini-2.0-flash-lite-001", "max_requests_per_session": 300},
+    {"name": "gemma-4-26b-a4b-it", "max_requests_per_session": 300},
+    {"name": "gemma-4-31b-it", "max_requests_per_session": 300},
+
+    # --- Pro-tier text models (paid-only since Apr 1, 2026 — skipped
+    # automatically on free-tier accounts via zero-quota detection) ---
+    {"name": "gemini-pro-latest", "max_requests_per_session": 100},
+    {"name": "gemini-2.5-pro", "max_requests_per_session": 100},
+    {"name": "gemini-3-pro-preview", "max_requests_per_session": 100},
+    {"name": "gemini-3.1-pro-preview", "max_requests_per_session": 100},
+    {"name": "gemini-3.1-pro-preview-customtools", "max_requests_per_session": 100},
+
+    # --- Image generation models ("Nano Banana" family) — return images,
+    # not text; only useful if the agent has an image-handling code path ---
+    {"name": "gemini-2.5-flash-image", "max_requests_per_session": 100},
+    {"name": "gemini-3-pro-image-preview", "max_requests_per_session": 100},
+    {"name": "gemini-3-pro-image", "max_requests_per_session": 100},
+    {"name": "nano-banana-pro-preview", "max_requests_per_session": 100},
+    {"name": "gemini-3.1-flash-image-preview", "max_requests_per_session": 100},
+    {"name": "gemini-3.1-flash-image", "max_requests_per_session": 100},
+    {"name": "gemini-3.1-flash-lite-image", "max_requests_per_session": 100},
+
+    # --- TTS / audio models — return audio, not text ---
+    {"name": "gemini-2.5-flash-preview-tts", "max_requests_per_session": 100},
+    {"name": "gemini-2.5-pro-preview-tts", "max_requests_per_session": 100},
+    {"name": "gemini-3.1-flash-tts-preview", "max_requests_per_session": 100},
+
+    # --- Music generation models (Lyria) ---
+    {"name": "lyria-3-clip-preview", "max_requests_per_session": 100},
+    {"name": "lyria-3-pro-preview", "max_requests_per_session": 100},
+
+    # --- Robotics / computer-use / agentic preview models ---
+    {"name": "gemini-robotics-er-1.5-preview", "max_requests_per_session": 100},
+    {"name": "gemini-robotics-er-1.6-preview", "max_requests_per_session": 100},
+    {"name": "gemini-robotics-er-2-preview", "max_requests_per_session": 100},
+    {"name": "gemini-2.5-computer-use-preview-10-2025", "max_requests_per_session": 100},
+    {"name": "antigravity-preview-05-2026", "max_requests_per_session": 100},
+
+    # --- Deep Research previews ---
+    {"name": "deep-research-max-preview-04-2026", "max_requests_per_session": 50},
+    {"name": "deep-research-preview-04-2026", "max_requests_per_session": 50},
+    {"name": "deep-research-pro-preview-12-2025", "max_requests_per_session": 50},
 ]
 
 # The actual chain used at runtime: the saved override from /settings if one
