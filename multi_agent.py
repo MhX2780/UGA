@@ -301,7 +301,7 @@ class MultiAgentOrchestrator:
             })
             step.status = "running"
             try:
-                for event in self._execute_step(step, full_plan_str, user_message):
+                for event in self._execute_step(step, len(steps), full_plan_str, user_message):
                     yield event
                 step.status = "done"
             except Exception as e:

@@ -307,9 +307,39 @@ class ModelRouter:
                     break
 
         self._report_status(
-            f"{C.BLUE}{model_name} (role model) unavailable, falling back to main chain{C.RESET}"
+            f"{C.BLUE}{model_name} (role model) unavailable, trying fallback chain{C.RESET}"
         )
-        return self.generate(contents, system_instruction=system_instruction, tools=tools)
+        return self._generate_fallback_chain(contents, system_instruction, tools, last_error)
+
+    def _generate_fallback_chain(self, contents, system_instruction, tools, original_error) -> Any:
+        """
+        Tries every model in config.MODEL_CHAIN (in order) as a one-off
+        fallback, WITHOUT mutating self.current_index — this is what keeps a
+        multi-agent role's fallback from bleeding into (and corrupting)
+        the single-agent chain's own "sticky" model selection. Each model
+        gets one attempt here (no per-model retry loop — the caller already
+        retried the originally-requested model); this is purely "is there
+        ANY model in the chain that can answer this one request right now".
+        """
+        last_error = original_error
+        for model_entry in config.MODEL_CHAIN:
+            candidate = model_entry["name"]
+            try:
+                gen_config = self._build_config(system_instruction, tools)
+                response = self.client.models.generate_content(
+                    model=candidate,
+                    contents=contents,
+                    config=gen_config,
+                )
+                self.request_counts.setdefault(candidate, 0)
+                self.request_counts[candidate] += 1
+                self._bump_stat(candidate, "success")
+                return response
+            except Exception as e:
+                last_error = e
+                self._bump_stat(candidate, "failure")
+                continue
+        raise RuntimeError(f"All models failed for this role-based call. Last error: {last_error}")
 
     def generate_stream_with_model(self, model_name: str, contents, system_instruction: Optional[str] = None,
                                     tools: Optional[list] = None) -> Iterator[str]:
@@ -354,10 +384,43 @@ class ModelRouter:
                     break
 
         self._report_status(
-            f"{C.BLUE}{model_name} (role model) unavailable, falling back to main chain{C.RESET}"
+            f"{C.BLUE}{model_name} (role model) unavailable, trying fallback chain{C.RESET}"
         )
-        for chunk in self.generate_stream(contents, system_instruction=system_instruction, tools=tools):
-            yield chunk
+        yield from self._generate_stream_fallback_chain(contents, system_instruction, tools, last_error)
+
+    def _generate_stream_fallback_chain(self, contents, system_instruction, tools, original_error) -> Iterator[str]:
+        """Streaming counterpart to _generate_fallback_chain — see its
+        docstring for why this avoids self.generate_stream() (which would
+        mutate self.current_index and contaminate single-agent state)."""
+        last_error = original_error
+        for model_entry in config.MODEL_CHAIN:
+            candidate = model_entry["name"]
+            got_any_output = False
+            try:
+                gen_config = self._build_config(system_instruction, tools)
+                for chunk in self.client.models.generate_content_stream(
+                    model=candidate,
+                    contents=contents,
+                    config=gen_config,
+                ):
+                    chunk_text = getattr(chunk, "text", None)
+                    if chunk_text:
+                        got_any_output = True
+                        yield chunk_text
+                self.request_counts.setdefault(candidate, 0)
+                self.request_counts[candidate] += 1
+                self._bump_stat(candidate, "success")
+                return
+            except Exception as e:
+                last_error = e
+                self._bump_stat(candidate, "failure")
+                if got_any_output:
+                    # Already streamed partial content under this candidate
+                    # — don't silently retry another model and duplicate
+                    # output; surface the error same as the main chain does.
+                    raise
+                continue
+        raise RuntimeError(f"All models failed for this role-based streaming call. Last error: {last_error}")
 
     # ---------- main entrypoint (non-streaming) ----------
     def generate(self, contents, system_instruction: Optional[str] = None,

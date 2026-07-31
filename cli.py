@@ -43,6 +43,7 @@ if os.environ.get("AGENT_ENABLE_TAB_COMPLETE") == "1":
 
 import config
 import tools
+import model_router
 from agent import GeminiAgent
 from colors import C, draw_box
 from markdown_render import render_markdown
@@ -58,6 +59,7 @@ logging.getLogger("google_genai.types").setLevel(logging.ERROR)
 SLASH_COMMANDS = [
     "/help", "/clear", "/remember", "/memory", "/forget", "/undo", "/tree",
     "/ps", "/log", "/clearlog", "/image", "/force_review",
+    "/multi-agent", "/settings",
     "/stats", "/workspace", "/resetkey", "/exit", "/quit",
 ]
 
@@ -74,6 +76,8 @@ COMMAND_HINTS = {
     "/clearlog": "clear the execution log",
     "/image": "attach one or more images to your next message",
     "/force_review": "force the Agent to read and understand every file",
+    "/multi-agent": "toggle multi-agent mode (plan/execute/review team) on or off",
+    "/settings": "view or change model chain, roles, and multi-agent settings",
     "/stats": "model usage report and switches",
     "/workspace": "show the workspace path",
     "/resetkey": "delete the saved API key",
@@ -147,6 +151,8 @@ def print_help():
         ("/clearlog", "clear the execution log"),
         ("/image", "attach one or more images to your next message"),
         ("/force_review", "force reading/understanding every project file"),
+        ("/multi-agent", "toggle the plan/execute/review team on or off"),
+        ("/settings", "view or change models, roles, multi-agent settings"),
         ("/stats", "model usage report and automatic switches"),
         ("/workspace", "show the workspace path"),
         ("/resetkey", "delete the saved API key"),
@@ -295,6 +301,126 @@ def print_reply_streaming(chunk_iterator, status: "LiveStatusLine"):
     return "".join(full_text_parts)
 
 
+def print_multi_agent_turn(event_iterator, status: "LiveStatusLine"):
+    """
+    Consumes a stream of multi_agent.MultiAgentEvent objects (from
+    GeminiAgent.run_multi_agent_turn) and renders the team's progress live:
+
+        Plan 1 of 3
+
+        Plan 1:
+         Created main.py
+         Deleted old.py
+        Plan 2:
+         Running command...
+         git clone ...
+        Plan 3:
+         Code check
+         Zip workspace
+
+    followed by the reviewer's final streamed summary. If the request was
+    classified as "simple", this just prints the plain single-agent reply
+    (no plan box) — multi-agent overhead is only shown when it actually ran.
+
+    Any exception raised mid-stream (e.g. every model in a role's fallback
+    chain failing) is caught here so a single failed step never crashes the
+    whole CLI session — it's reported as a clear error and whatever
+    steps/text were already shown remain on screen.
+    """
+    current_step_number = None
+    step_action_lines: dict = {}  # step_number -> list of action summary strings
+    total_steps_seen = None
+    reply_prefix_printed = False
+
+    def ensure_reply_prefix():
+        nonlocal reply_prefix_printed
+        if not reply_prefix_printed:
+            status.stop()
+            print(f"{C.GREEN}{C.BOLD}🤖 Agent{C.RESET} {C.GREEN}›{C.RESET} ", end="", flush=True)
+            reply_prefix_printed = True
+
+    full_text_parts = []
+    line_buffer = ""
+    first_text_line = True
+
+    try:
+        for event in event_iterator:
+            if event.kind == "classified":
+                if event.data["complexity"] == "simple":
+                    status.set_activity("Thinking...")
+                continue
+
+            if event.kind == "plan_ready":
+                status.stop()
+                steps = event.data["steps"]
+                total_steps_seen = len(steps)
+                print(f"\n{C.BOLD}{C.VIOLET}Plan 1 of {total_steps_seen}{C.RESET}\n")
+                status.start()
+                continue
+
+            if event.kind == "step_start":
+                status.stop()
+                n = event.data["step_number"]
+                total = event.data["total_steps"]
+                current_step_number = n
+                step_action_lines[n] = []
+                print(f"{C.BOLD}{C.CYAN}Plan {n}:{C.RESET}")
+                status = LiveStatusLine()
+                tools.set_activity_callback(make_activity_printer(status))
+                status.start()
+                continue
+
+            if event.kind == "step_action":
+                n = event.data["step_number"]
+                summary = event.data["action_summary"]
+                step_action_lines.setdefault(n, []).append(summary)
+                status.stop()
+                print(f" {summary}")
+                status = LiveStatusLine()
+                tools.set_activity_callback(make_activity_printer(status))
+                status.start()
+                continue
+
+            if event.kind == "step_done":
+                n = event.data["step_number"]
+                if not step_action_lines.get(n):
+                    status.stop()
+                    print(f" {C.DIM}(no actions taken for this step){C.RESET}")
+                    status = LiveStatusLine()
+                    tools.set_activity_callback(make_activity_printer(status))
+                    status.start()
+                continue
+
+            if event.kind == "text_chunk":
+                ensure_reply_prefix()
+                chunk = event.data["text"]
+                full_text_parts.append(chunk)
+                line_buffer += chunk
+                while "\n" in line_buffer:
+                    line, line_buffer = line_buffer.split("\n", 1)
+                    if not first_text_line:
+                        print()
+                    print(render_markdown(line), end="", flush=True)
+                    first_text_line = False
+                continue
+    except Exception as e:
+        status.stop()
+        print(f"\n{C.RED}❌ Multi-agent turn failed: {e}{C.RESET}")
+        print(f"{C.DIM}(Any steps completed above were still carried out and are not undone.){C.RESET}\n")
+        return "".join(full_text_parts)
+    finally:
+        status.stop()
+
+    ensure_reply_prefix()
+    if line_buffer:
+        if not first_text_line:
+            print()
+        print(render_markdown(line_buffer), end="", flush=True)
+
+    print("\n")
+    return "".join(full_text_parts)
+
+
 # ---------------- live file-activity status (shown on the spinner line) ----------------
 _ACTIVITY_LABELS = {
     "creating": "Creating file",
@@ -394,17 +520,143 @@ def _prompt_for_images() -> list:
     return valid_paths
 
 
+def _persist_current_settings():
+    """Saves the live in-memory config (model chain, multi-agent roles/state)
+    to settings.json so changes made via /settings or /multi-agent survive
+    a restart."""
+    config.save_settings(config.get_current_settings_snapshot())
+
+
+def print_settings_menu(agent):
+    """
+    Shows the current settings (model chain, multi-agent roles/enabled
+    state) and how to change them. Actual editing happens via focused
+    sub-commands rather than a single freeform /settings prompt, to avoid
+    ambiguous input parsing:
+      /settings models          — list every model available to this API key
+      /settings role <role> <model>  — assign a model to a multi-agent role
+      /settings chain <model1,model2,...> — replace the model failover chain
+    """
+    lines = [
+        f"{C.BOLD}Model chain{C.RESET} (failover order):",
+    ]
+    for i, m in enumerate(config.MODEL_CHAIN):
+        marker = "→" if i == agent.router.current_index else " "
+        lines.append(f"  {marker} {m['name']}  {C.DIM}(cap: {m.get('max_requests_per_session') or 'none'}){C.RESET}")
+
+    lines.append("")
+    lines.append(f"{C.BOLD}Multi-agent roles{C.RESET}:")
+    for role, model in config.MULTI_AGENT_ROLES.items():
+        lines.append(f"  {C.CYAN}{role:<12}{C.RESET} {model}")
+    lines.append(f"  Multi-agent mode: {'ON' if config.MULTI_AGENT_ENABLED else 'OFF'} (toggle with /multi-agent)")
+
+    lines.append("")
+    lines.append(f"{C.DIM}To change things:{C.RESET}")
+    lines.append(f"  {C.CYAN}/settings models{C.RESET}          list every model your API key can use")
+    lines.append(f"  {C.CYAN}/settings role <role> <model>{C.RESET}  assign a model to a role, e.g.")
+    lines.append(f"                                 /settings role planner gemini-2.5-pro")
+    lines.append(f"  {C.CYAN}/settings chain <m1,m2,...>{C.RESET}    replace the failover chain order")
+
+    print(draw_box("Settings", lines, color=C.TEAL))
+
+
+def handle_settings_subcommand(agent, rest: str):
+    """
+    Handles '/settings <subcommand> ...' — models / role / chain. Called
+    from the main loop when user_input starts with '/settings ' (i.e. has
+    an argument), as opposed to bare '/settings' which just shows the menu.
+    """
+    parts = rest.strip().split(maxsplit=2)
+    if not parts:
+        print_settings_menu(agent)
+        return
+
+    sub = parts[0].lower()
+
+    if sub == "models":
+        print(f"{C.DIM}Fetching available models for your API key...{C.RESET}")
+        try:
+            available = model_router.fetch_available_models(config.GEMINI_API_KEY or config.load_saved_api_key())
+        except Exception as e:
+            print(f"{C.RED}❌ Could not fetch models: {e}{C.RESET}")
+            return
+        if not available:
+            print(f"{C.DIM}No text-generation-capable models found for this key.{C.RESET}")
+            return
+        lines = []
+        for m in available:
+            in_chain = " (in chain)" if m["name"] in [c["name"] for c in config.MODEL_CHAIN] else ""
+            lines.append(f"  {C.CYAN}{m['name']}{C.RESET}{C.DIM}{in_chain}{C.RESET}")
+            lines.append(f"    {C.DIM}{m['display_name']} — in:{m['input_token_limit']} out:{m['output_token_limit']}{C.RESET}")
+        print(draw_box(f"Available models ({len(available)})", lines, color=C.TEAL))
+        return
+
+    if sub == "role":
+        if len(parts) < 3:
+            print(f"{C.YELLOW}⚠️  Usage: /settings role <role> <model>  "
+                  f"(roles: {', '.join(config.MULTI_AGENT_ROLES.keys())}){C.RESET}")
+            return
+        role, model_name = parts[1], parts[2].strip()
+        if role not in config.MULTI_AGENT_ROLES:
+            print(f"{C.YELLOW}⚠️  Unknown role '{role}'. Valid roles: "
+                  f"{', '.join(config.MULTI_AGENT_ROLES.keys())}{C.RESET}")
+            return
+        config.MULTI_AGENT_ROLES[role] = model_name
+        _persist_current_settings()
+        print(f"{C.GREEN}✅ Role '{role}' assigned to model '{model_name}'.{C.RESET}")
+        return
+
+    if sub == "chain":
+        if len(parts) < 2:
+            print(f"{C.YELLOW}⚠️  Usage: /settings chain <model1,model2,...>{C.RESET}")
+            return
+        model_names = [m.strip() for m in " ".join(parts[1:]).split(",") if m.strip()]
+        if not model_names:
+            print(f"{C.YELLOW}⚠️  No model names provided.{C.RESET}")
+            return
+        new_chain = [{"name": name, "max_requests_per_session": 200} for name in model_names]
+        config.MODEL_CHAIN.clear()
+        config.MODEL_CHAIN.extend(new_chain)
+        agent.router.chain = config.MODEL_CHAIN
+        agent.router.current_index = 0
+        agent.router.request_counts = {m["name"]: 0 for m in config.MODEL_CHAIN}
+        _persist_current_settings()
+        print(f"{C.GREEN}✅ Model chain updated: {' → '.join(model_names)}{C.RESET}")
+        return
+
+    print(f"{C.YELLOW}⚠️  Unknown /settings subcommand '{sub}'. Try /settings for the menu.{C.RESET}")
+
+
 def _send_and_print(agent, message: str, image_paths: list = None):
     """
     Shared helper: sends a message to the agent via the standard streaming
     flow (status line wired up, error handling included) and prints the
     reply. Used by both the normal message loop and special commands like
     /image and /force_review that construct their own message text.
+
+    If multi-agent mode is enabled (config.MULTI_AGENT_ENABLED, toggled via
+    /multi-agent) and no images are attached, this routes through the
+    classifier -> plan -> execute -> review pipeline instead of the plain
+    single-model flow. Image attachments always use the plain flow since
+    the multi-agent prompts aren't built to carry image parts through the
+    planning stage.
     """
     status = LiveStatusLine()
     tools.set_activity_callback(make_activity_printer(status))
     agent.router.set_status_callback(status.set_activity)
     status.start()
+
+    if config.MULTI_AGENT_ENABLED and not image_paths:
+        try:
+            print_multi_agent_turn(agent.run_multi_agent_turn(message), status)
+        except RuntimeError as e:
+            status.stop()
+            print(f"\n{C.RED}❌ All models failed: {e}{C.RESET}\n")
+        except Exception as e:
+            status.stop()
+            print(f"\n{C.RED}❌ Unexpected error: {e}{C.RESET}\n")
+        return
+
     try:
         print_reply_streaming(agent.send_stream(message, image_paths=image_paths), status)
     except RuntimeError as e:
@@ -644,6 +896,30 @@ def main():
             print(f"{C.YELLOW}🔍 Forcing a full review of {file_count} file(s)... "
                   f"this may take a while and use more tokens than usual.{C.RESET}")
             _send_and_print(agent, review_message)
+            continue
+
+        if user_input == "/multi-agent":
+            config.MULTI_AGENT_ENABLED = not config.MULTI_AGENT_ENABLED
+            _persist_current_settings()
+            state = f"{C.GREEN}ON{C.RESET}" if config.MULTI_AGENT_ENABLED else f"{C.DIM}OFF{C.RESET}"
+            lines = [f"Multi-agent mode: {state}"]
+            if config.MULTI_AGENT_ENABLED:
+                lines.append("")
+                lines.append(f"{C.DIM}Simple requests still get a direct answer; complex ones{C.RESET}")
+                lines.append(f"{C.DIM}get a plan -> execute -> review pipeline. Current roles:{C.RESET}")
+                for role, model in config.MULTI_AGENT_ROLES.items():
+                    lines.append(f"  {C.CYAN}{role:<12}{C.RESET} {model}")
+                lines.append("")
+                lines.append(f"{C.DIM}Change role models with /settings.{C.RESET}")
+            print(draw_box("Multi-agent", lines, color=C.VIOLET))
+            continue
+
+        if user_input == "/settings":
+            print_settings_menu(agent)
+            continue
+
+        if user_input.startswith("/settings "):
+            handle_settings_subcommand(agent, user_input[len("/settings "):])
             continue
 
         if user_input == "/stats":
