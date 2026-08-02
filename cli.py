@@ -44,8 +44,9 @@ if os.environ.get("AGENT_ENABLE_TAB_COMPLETE") == "1":
 import config
 import tools
 import model_router
+import providers
 from agent import GeminiAgent
-from colors import C, draw_box
+from colors import C, draw_box, select_menu
 from markdown_render import render_markdown
 
 # The google-genai SDK logs a harmless warning whenever a response mixes text
@@ -60,7 +61,7 @@ SLASH_COMMANDS = [
     "/help", "/clear", "/remember", "/memory", "/forget", "/undo", "/tree",
     "/ps", "/log", "/clearlog", "/image", "/force_review",
     "/multi-agent", "/settings",
-    "/stats", "/workspace", "/resetkey", "/exit", "/quit",
+    "/stats", "/workspace", "/resetkey", "/keys", "/puterJS", "/exit", "/quit",
 ]
 
 COMMAND_HINTS = {
@@ -81,6 +82,8 @@ COMMAND_HINTS = {
     "/stats": "model usage report and switches",
     "/workspace": "show the workspace path",
     "/resetkey": "delete the saved API key",
+    "/keys": "manage multiple Gemini API keys (list/add/remove)",
+    "/puterJS": "connect Puter.js for free access to 500+ AI models",
     "/exit": "quit the program",
     "/quit": "quit the program",
 }
@@ -156,6 +159,9 @@ def print_help():
         ("/stats", "model usage report and automatic switches"),
         ("/workspace", "show the workspace path"),
         ("/resetkey", "delete the saved API key"),
+        ("/keys", "manage multiple Gemini API keys (list/add/remove)"),
+        ("/puterJS", "connect Puter.js for free access to 500+ AI models"),
+        ("/puterJS", "connect Puter.js for free access to 500+ AI models"),
         ("/exit, /quit", "quit the program"),
     ]
     lines = [f"{C.CYAN}{cmd:<16}{C.RESET} {desc}" for cmd, desc in rows]
@@ -527,6 +533,145 @@ def _persist_current_settings():
     config.save_settings(config.get_current_settings_snapshot())
 
 
+def handle_puterjs_command():
+    """
+    Connects Puter.js — free access to 500+ AI models (Claude, GPT, Gemini,
+    DeepSeek, and more) via a "User-Pays" model where usage is billed to
+    whichever Puter account signs in, not to this app.
+
+    Presents an arrow-key selectable menu (see colors.select_menu) with two
+    options, exactly as requested:
+      1) Sign in via browser — opens Puter's own sign-in/dashboard page;
+         the user creates a token there and pastes it back (Puter.js itself
+         is browser-only and doesn't hand back a token to a Python process
+         automatically, so this is "assisted paste" rather than a fully
+         automated callback).
+      2) Paste an auth token directly — for a user who already has a token
+         from a previous session, skips opening a browser entirely.
+    """
+    choice = select_menu(
+        "🧩 Connect Puter.js",
+        ["Sign in via browser", "Paste an auth token directly"],
+        [
+            "Opens puter.com to sign in, then you copy your token back here",
+            "Already have a token from puter.com/dashboard#account? Skip the browser",
+        ],
+    )
+    if choice is None:
+        print(f"{C.DIM}Cancelled.{C.RESET}")
+        return
+
+    if choice == 0:
+        dashboard_url = "https://puter.com/dashboard#account"
+        print(f"{C.DIM}Opening {dashboard_url} in your browser...{C.RESET}")
+        try:
+            import webbrowser
+            opened = webbrowser.open(dashboard_url)
+        except Exception:
+            opened = False
+        if not opened:
+            print(f"{C.YELLOW}⚠️  Couldn't open a browser automatically. "
+                  f"Visit this URL manually:{C.RESET}\n  {dashboard_url}")
+        print(f"{C.DIM}On that page: sign in, then click 'Create token' under Account.{C.RESET}")
+
+    token = input(f"{C.BOLD}Paste your Puter auth token{C.RESET} {C.MAGENTA}›{C.RESET} ").strip()
+    if not token:
+        print(f"{C.DIM}No token entered — cancelled.{C.RESET}")
+        return
+
+    providers.save_provider_api_key("puter", token)
+    print(f"{C.GREEN}✅ Puter.js token saved.{C.RESET}")
+
+    print(f"{C.DIM}Verifying and fetching your available models...{C.RESET}")
+    try:
+        models = providers.puter_list_models()
+    except Exception as e:
+        print(f"{C.YELLOW}⚠️  Token saved, but couldn't verify it yet: {e}{C.RESET}")
+        return
+
+    preview = models[:15]
+    lines = [f"  {C.CYAN}{m}{C.RESET}" for m in preview]
+    if len(models) > len(preview):
+        lines.append(f"  {C.DIM}...and {len(models) - len(preview)} more{C.RESET}")
+    lines.append("")
+    lines.append(f"{C.DIM}Assign one to a multi-agent role with:{C.RESET}")
+    lines.append(f"  {C.CYAN}/settings role <role> <model-name>{C.RESET}")
+    print(draw_box(f"Puter.js connected — {len(models)} model(s) available", lines, color=C.GREEN))
+
+
+def print_keys_menu(agent):
+    """
+    Shows every configured Gemini API key (masked — never the full secret),
+    which one is currently active, and how to add/remove additional keys.
+    """
+    pool = config.load_api_key_pool()
+    lines = []
+    if not pool:
+        lines.append(f"{C.DIM}No API keys configured.{C.RESET}")
+    else:
+        for i, key in enumerate(pool):
+            marker = "→" if i == agent.router.current_key_index else " "
+            active = f" {C.GREEN}(active){C.RESET}" if i == agent.router.current_key_index else ""
+            lines.append(f"  {marker} #{i + 1}  {config.mask_api_key(key)}{active}")
+
+    lines.append("")
+    lines.append(f"{C.DIM}Why multiple keys? Each Gemini API key has its own daily request{C.RESET}")
+    lines.append(f"{C.DIM}quota (RPD). When one key's quota is exhausted for a model, the{C.RESET}")
+    lines.append(f"{C.DIM}agent automatically rotates to the next configured key instead of{C.RESET}")
+    lines.append(f"{C.DIM}waiting until tomorrow.{C.RESET}")
+    lines.append("")
+    lines.append(f"{C.CYAN}/keys add <key>{C.RESET}          add another Gemini API key to the pool")
+    lines.append(f"{C.CYAN}/keys remove <last4chars>{C.RESET}  remove a key by its last few characters")
+
+    print(draw_box("API Keys", lines, color=C.TEAL))
+
+
+def handle_keys_subcommand(agent, rest: str):
+    """Handles '/keys add <key>' and '/keys remove <suffix>'."""
+    parts = rest.strip().split(maxsplit=1)
+    if not parts:
+        print_keys_menu(agent)
+        return
+
+    sub = parts[0].lower()
+
+    if sub == "add":
+        if len(parts) < 2 or not parts[1].strip():
+            print(f"{C.YELLOW}⚠️  Usage: /keys add <your-gemini-api-key>{C.RESET}")
+            return
+        new_key = parts[1].strip()
+        existing_pool = config.load_api_key_pool()
+        if new_key in existing_pool:
+            print(f"{C.DIM}ℹ️  That key is already in the pool.{C.RESET}")
+            return
+        config.add_api_key_to_pool(new_key)
+        # Refresh the live router's pool so the new key is usable immediately,
+        # without needing to restart the CLI.
+        agent.router.key_pool = config.load_api_key_pool()
+        print(f"{C.GREEN}✅ Added key {config.mask_api_key(new_key)} to the pool "
+              f"({len(agent.router.key_pool)} key(s) total).{C.RESET}")
+        return
+
+    if sub == "remove":
+        if len(parts) < 2 or not parts[1].strip():
+            print(f"{C.YELLOW}⚠️  Usage: /keys remove <last-characters-of-key>{C.RESET}")
+            return
+        suffix = parts[1].strip()
+        removed = config.remove_api_key_from_pool(suffix)
+        if removed:
+            agent.router.key_pool = config.load_api_key_pool()
+            if agent.router.current_key_index >= len(agent.router.key_pool):
+                agent.router.current_key_index = 0
+            print(f"{C.GREEN}✅ Removed a key ending in '{suffix}'. "
+                  f"{len(agent.router.key_pool)} key(s) remain.{C.RESET}")
+        else:
+            print(f"{C.YELLOW}⚠️  No pool key found ending in '{suffix}'. "
+                  f"(The primary key can't be removed this way — use /resetkey.){C.RESET}")
+        return
+
+    print(f"{C.YELLOW}⚠️  Unknown /keys subcommand '{sub}'. Try /keys for the menu.{C.RESET}")
+
+
 def print_settings_menu(agent):
     """
     Shows the current settings (model chain, multi-agent roles/enabled
@@ -622,6 +767,50 @@ def handle_settings_subcommand(agent, rest: str):
         agent.router.request_counts = {m["name"]: 0 for m in config.MODEL_CHAIN}
         _persist_current_settings()
         print(f"{C.GREEN}✅ Model chain updated: {' → '.join(model_names)}{C.RESET}")
+        return
+
+    if sub == "provider":
+        if len(parts) < 2:
+            configured = [p for p in providers.PROVIDERS if providers.has_provider_key(p)]
+            lines = [f"{C.DIM}For multi-agent roles only (executor always uses Gemini):{C.RESET}"]
+            for pid, info in providers.PROVIDERS.items():
+                if pid == "gemini":
+                    continue
+                status = f"{C.GREEN}configured{C.RESET}" if pid in configured else f"{C.DIM}not set{C.RESET}"
+                lines.append(f"  {C.CYAN}{pid:<10}{C.RESET} {info['label']:<26} {status}")
+            lines.append("")
+            lines.append(f"  {C.CYAN}/settings provider <name> <key>{C.RESET}   set a key/token")
+            lines.append(f"  {C.CYAN}/settings provider puter models{C.RESET}   list models available via Puter")
+            print(draw_box("Providers", lines, color=C.TEAL))
+            return
+
+        provider_id = parts[1].lower()
+        if provider_id not in providers.PROVIDERS or provider_id == "gemini":
+            print(f"{C.YELLOW}⚠️  Unknown provider '{provider_id}'. Valid: "
+                  f"{', '.join(p for p in providers.PROVIDERS if p != 'gemini')}{C.RESET}")
+            return
+
+        if provider_id == "puter" and len(parts) >= 3 and parts[2].strip().lower() == "models":
+            if not providers.has_provider_key("puter"):
+                print(f"{C.YELLOW}⚠️  No Puter token configured yet — use /puterJS first.{C.RESET}")
+                return
+            try:
+                models = providers.puter_list_models()
+            except Exception as e:
+                print(f"{C.RED}❌ Could not fetch Puter models: {e}{C.RESET}")
+                return
+            lines = [f"  {C.CYAN}{m}{C.RESET}" for m in models[:40]]
+            if len(models) > 40:
+                lines.append(f"  {C.DIM}...and {len(models) - 40} more{C.RESET}")
+            print(draw_box(f"Puter models ({len(models)})", lines, color=C.TEAL))
+            return
+
+        if len(parts) < 3:
+            print(f"{C.YELLOW}⚠️  Usage: /settings provider {provider_id} <key-or-token>{C.RESET}")
+            return
+        key_value = parts[2].strip()
+        providers.save_provider_api_key(provider_id, key_value)
+        print(f"{C.GREEN}✅ {providers.PROVIDERS[provider_id]['label']} key saved.{C.RESET}")
         return
 
     print(f"{C.YELLOW}⚠️  Unknown /settings subcommand '{sub}'. Try /settings for the menu.{C.RESET}")
@@ -936,6 +1125,18 @@ def main():
                 print(f"{C.YELLOW}🗑️  Saved API key deleted. Restart the program to enter a new one.{C.RESET}")
             else:
                 print(f"{C.DIM}ℹ️  No saved key exists.{C.RESET}")
+            continue
+
+        if user_input == "/keys":
+            print_keys_menu(agent)
+            continue
+
+        if user_input.startswith("/keys "):
+            handle_keys_subcommand(agent, user_input[len("/keys "):])
+            continue
+
+        if user_input == "/puterJS":
+            handle_puterjs_command()
             continue
 
         # ---------- unrecognized slash command ----------

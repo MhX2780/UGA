@@ -41,7 +41,8 @@ def _get_image_client():
 # MODEL_CHAIN in config.py, since not every chat model supports vision
 # input or image-generation output the same way).
 IMAGE_UNDERSTANDING_MODEL = "gemini-2.5-flash"  # any current Flash/Pro model handles vision input fine
-IMAGE_GENERATION_MODEL = "gemini-2.5-flash-image"  # "Nano Banana" — free tier, up to 500 req/day
+# Image generation model chain now lives in config.IMAGE_MODEL_CHAIN (with
+# automatic fallback across the list) — see Image_Create below.
 
 SUPPORTED_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 _IMAGE_MIME_TYPES = {
@@ -2013,22 +2014,31 @@ def Image_Create(prompt: str, output_path: str, aspect_ratio: str = "1:1") -> st
         return "❌ output_path must end in .png"
 
     _notify("creating", output_path)
+    from google.genai import types
     try:
-        from google.genai import types
         client = _get_image_client()
-
-        response = client.models.generate_content(
-            model=IMAGE_GENERATION_MODEL,
-            contents=[prompt],
-            config=types.GenerateContentConfig(
-                response_modalities=["Text", "Image"],
-                image_config=types.ImageConfig(aspect_ratio=aspect_ratio),
-            ),
-        )
     except RuntimeError as e:
         return f"❌ {e}"
-    except Exception as e:
-        return f"❌ Failed to generate image: {e}"
+
+    response = None
+    last_error = None
+    for model_name in config.IMAGE_MODEL_CHAIN:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[prompt],
+                config=types.GenerateContentConfig(
+                    response_modalities=["Text", "Image"],
+                    image_config=types.ImageConfig(aspect_ratio=aspect_ratio),
+                ),
+            )
+            break  # success — stop trying further models
+        except Exception as e:
+            last_error = e
+            continue  # try the next image model in the chain
+
+    if response is None:
+        return f"❌ Failed to generate image (all image models failed): {last_error}"
 
     image_bytes = None
     for candidate in response.candidates or []:

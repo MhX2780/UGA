@@ -10,6 +10,7 @@ import shutil
 import sys
 import threading
 import time
+from typing import Optional
 
 
 def _supports_color() -> bool:
@@ -171,3 +172,165 @@ class Spinner:
         if _ENABLED:
             sys.stdout.write(f"{C.CLEAR_LINE}{C.SHOW_CURSOR}")
             sys.stdout.flush()
+
+
+def _read_single_keypress() -> Optional[str]:
+    """
+    Reads one raw keypress from the terminal without waiting for Enter, and
+    returns a normalized name: "up", "down", "enter", "q" (quit/cancel), or
+    None if the key isn't one we care about (caller should just read again).
+    Returns None immediately (no blocking) if raw key reading isn't possible
+    in this environment (e.g. Windows without msvcrt for some reason, or
+    input isn't a real interactive terminal) — callers must have a fallback
+    for that case; see select_menu()'s numbered-input path.
+    """
+    if os.name == "nt":
+        try:
+            import msvcrt
+        except ImportError:
+            return "__unsupported__"
+        ch = msvcrt.getch()
+        if ch in (b"\xe0", b"\x00"):  # arrow key prefix on Windows
+            ch2 = msvcrt.getch()
+            if ch2 == b"H":
+                return "up"
+            if ch2 == b"P":
+                return "down"
+            return None
+        if ch in (b"\r", b"\n"):
+            return "enter"
+        if ch in (b"q", b"Q", b"\x03"):  # 'q' or Ctrl+C
+            return "q"
+        return None
+    else:
+        try:
+            import termios
+            import tty
+        except ImportError:
+            return "__unsupported__"
+        if not sys.stdin.isatty():
+            return "__unsupported__"
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        try:
+            tty.setraw(fd)
+            ch = sys.stdin.read(1)
+            if ch == "\x1b":  # ESC — start of an arrow-key escape sequence
+                ch2 = sys.stdin.read(1)
+                ch3 = sys.stdin.read(1)
+                if ch2 == "[" and ch3 == "A":
+                    return "up"
+                if ch2 == "[" and ch3 == "B":
+                    return "down"
+                return None
+            if ch in ("\r", "\n"):
+                return "enter"
+            if ch in ("q", "Q", "\x03"):
+                return "q"
+            return None
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+
+
+def select_menu(title: str, options: list, descriptions: list = None) -> Optional[int]:
+    """
+    Shows an arrow-key navigable menu (↑/↓ to move, Enter to select, q/Ctrl+C
+    to cancel) and returns the selected option's index, or None if cancelled.
+
+    Falls back automatically to plain numbered input ("1", "2", ... then
+    Enter) if raw keypress reading isn't available in the current
+    environment (e.g. piped/non-interactive stdin, or an unsupported
+    platform) — the menu always works, just without live arrow-key
+    highlighting in that fallback case.
+
+    Args:
+        title: heading shown above the options
+        options: list of option label strings
+        descriptions: optional list of one-line descriptions shown dimmed
+            under each option (same length as options, or None)
+    """
+    if not options:
+        return None
+
+    selected = 0
+
+    def render():
+        lines = [f"{C.BOLD}{title}{C.RESET}", ""]
+        for i, opt in enumerate(options):
+            marker = f"{C.GREEN}❯{C.RESET}" if i == selected else " "
+            label = f"{C.BOLD}{opt}{C.RESET}" if i == selected else opt
+            lines.append(f"{marker} {label}")
+            if descriptions and i < len(descriptions) and descriptions[i]:
+                lines.append(f"   {C.DIM}{descriptions[i]}{C.RESET}")
+        lines.append("")
+        lines.append(f"{C.DIM}↑/↓ to move, Enter to select, q to cancel{C.RESET}")
+        return "\n".join(lines)
+
+    if not _ENABLED or not sys.stdin.isatty():
+        # No interactive terminal (or colors disabled, usually correlated
+        # with non-interactive input too) — plain numbered fallback.
+        print(f"{title}\n")
+        for i, opt in enumerate(options):
+            print(f"  {i + 1}. {opt}")
+            if descriptions and i < len(descriptions) and descriptions[i]:
+                print(f"     {descriptions[i]}")
+        try:
+            raw = input(f"\nChoose 1-{len(options)} (or Enter to cancel): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if not raw:
+            return None
+        try:
+            choice = int(raw) - 1
+            return choice if 0 <= choice < len(options) else None
+        except ValueError:
+            return None
+
+    sys.stdout.write(C.HIDE_CURSOR)
+    rendered = render()
+    print(rendered)
+    line_count = rendered.count("\n") + 1
+
+    try:
+        while True:
+            key = _read_single_keypress()
+            if key == "__unsupported__":
+                # Raw key reading isn't available after all (detected only
+                # once we actually tried) — erase what we drew and fall
+                # back to numbered input instead of hanging.
+                sys.stdout.write(f"\033[{line_count}A\033[J")
+                sys.stdout.write(C.SHOW_CURSOR)
+                print(f"{title}\n")
+                for i, opt in enumerate(options):
+                    print(f"  {i + 1}. {opt}")
+                try:
+                    raw = input(f"\nChoose 1-{len(options)} (or Enter to cancel): ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    return None
+                if not raw:
+                    return None
+                try:
+                    choice = int(raw) - 1
+                    return choice if 0 <= choice < len(options) else None
+                except ValueError:
+                    return None
+            elif key == "up":
+                selected = (selected - 1) % len(options)
+            elif key == "down":
+                selected = (selected + 1) % len(options)
+            elif key == "enter":
+                return selected
+            elif key == "q":
+                return None
+            else:
+                continue  # unrecognized key — just wait for the next one
+
+            # Redraw in place: move cursor up to the start of our block and
+            # clear to the end of the screen before printing the new state.
+            sys.stdout.write(f"\033[{line_count}A\033[J")
+            rendered = render()
+            print(rendered)
+            line_count = rendered.count("\n") + 1
+    finally:
+        sys.stdout.write(C.SHOW_CURSOR)
+        sys.stdout.flush()

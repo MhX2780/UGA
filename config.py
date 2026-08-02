@@ -67,6 +67,123 @@ def save_api_key(key: str):
 
 GEMINI_API_KEY = load_saved_api_key()
 
+# ---------- Puter.js auth token (optional — see providers.py) ----------
+# Puter.js gives free access to Claude/GPT/Gemini/DeepSeek/etc. under its
+# "User-Pays" model: each user authenticates their OWN Puter account, and
+# usage is billed to them, not the app developer. Puter.js itself is a
+# browser-only SDK, but Puter documents an "auth token" (from
+# puter.com/dashboard#account -> Create token) that works directly against
+# their OpenAI-compatible REST endpoint from any environment — including
+# plain Python, no browser needed. That's what's stored here.
+PUTER_TOKEN_FILE = BASE_DIR / ".puter_token"
+
+
+def load_puter_token() -> str:
+    """Reads the saved Puter auth token from the local file if it exists,
+    else returns ''."""
+    if PUTER_TOKEN_FILE.exists():
+        return PUTER_TOKEN_FILE.read_text(encoding="utf-8").strip()
+    return ""
+
+
+def save_puter_token(token: str):
+    """Saves the Puter auth token to a local file with owner-only
+    read/write permissions, same as the Gemini key."""
+    PUTER_TOKEN_FILE.write_text(token.strip(), encoding="utf-8")
+    try:
+        os.chmod(PUTER_TOKEN_FILE, 0o600)
+    except OSError:
+        pass
+
+
+def delete_puter_token():
+    if PUTER_TOKEN_FILE.exists():
+        PUTER_TOKEN_FILE.unlink()
+
+# ---------- Multiple Gemini API keys (Google AI Studio) ----------
+# Beyond the single "primary" key above (kept for backward compatibility —
+# older saved installs and simple single-key setups keep working exactly as
+# before), the agent can hold a POOL of additional Gemini API keys and
+# rotate to the next one specifically when a key hits its DAILY quota
+# (RPD) — which, unlike a per-minute rate limit, waiting out is never
+# useful for (see model_router.py's RPD/RPM distinction). This is the
+# actual fix for "the whole agent goes idle until tomorrow" once every
+# model in MODEL_CHAIN has also exhausted its daily quota on the current
+# key: instead of stopping there, it moves to the next configured key and
+# retries the SAME model chain from the top on that key.
+API_KEYS_FILE = BASE_DIR / ".gemini_api_keys.jsonl"
+
+
+def load_api_key_pool() -> list:
+    """
+    Returns the full list of configured Gemini API keys, in priority order
+    (the primary key from .gemini_api_key first if set, then any additional
+    keys from .gemini_api_keys.jsonl, keys deduplicated but order-preserved).
+    """
+    keys = []
+    primary = load_saved_api_key()
+    if primary:
+        keys.append(primary)
+    if API_KEYS_FILE.exists():
+        for line in API_KEYS_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line and line not in keys:
+                keys.append(line)
+    return keys
+
+
+def add_api_key_to_pool(key: str):
+    """
+    Adds an additional Gemini API key to the pool. If no primary key is set
+    yet (.gemini_api_key doesn't exist), this becomes the primary key
+    instead of going into the pool file — keeping the common single-key case
+    simple (nothing in .gemini_api_keys.jsonl at all until a SECOND key is
+    actually added).
+    """
+    key = key.strip()
+    if not key:
+        return
+    if not load_saved_api_key():
+        save_api_key(key)
+        return
+    existing = load_api_key_pool()
+    if key in existing:
+        return
+    with open(API_KEYS_FILE, "a", encoding="utf-8") as f:
+        f.write(key + "\n")
+    try:
+        os.chmod(API_KEYS_FILE, 0o600)
+    except OSError:
+        pass
+
+
+def remove_api_key_from_pool(key_suffix: str) -> bool:
+    """
+    Removes a key from the pool by matching its last N characters (so the
+    user can identify a specific key without needing to paste the whole
+    secret back, e.g. remove_api_key_from_pool("Xy12") to remove whichever
+    key ends in "Xy12"). Returns True if a key was found and removed, False
+    otherwise. Cannot remove the primary key this way (use /resetkey for
+    that) — only additional pool keys.
+    """
+    if not API_KEYS_FILE.exists():
+        return False
+    lines = [l.strip() for l in API_KEYS_FILE.read_text(encoding="utf-8").splitlines() if l.strip()]
+    matching = [l for l in lines if l.endswith(key_suffix)]
+    if not matching:
+        return False
+    remaining = [l for l in lines if l not in matching]
+    API_KEYS_FILE.write_text("\n".join(remaining) + ("\n" if remaining else ""), encoding="utf-8")
+    return True
+
+
+def mask_api_key(key: str) -> str:
+    """Returns a masked display form of a key, e.g. 'AIza...Xy12', for
+    showing in lists without printing the full secret to the terminal."""
+    if len(key) <= 8:
+        return "*" * len(key)
+    return f"{key[:4]}...{key[-4:]}"
+
 # ---------- User-editable settings (persisted, overrides the defaults below) ----------
 SETTINGS_FILE = BASE_DIR / "settings.json"
 
@@ -114,89 +231,115 @@ EXECUTION_LOG_CONTEXT_ENTRIES = 15
 # The first entry is preferred; on failure or quota exhaustion the router
 # moves to the next one.
 #
-# IMPORTANT — verified July 2026: as of April 1, 2026, Google removed ALL
-# Pro-tier models (gemini-2.5-pro, gemini-3-pro, gemini-3.1-pro) from the free
-# tier — they are now paid-only. Only Flash and Flash-Lite models retain a
-# free tier (with reduced daily quotas). Pro models are kept in the chain
-# below as fallbacks for paid accounts, but a free-tier account will simply
-# have them skipped automatically (via the zero-quota detection in
-# model_router.py) rather than ever succeeding on them.
+# IMPORTANT DESIGN NOTE: this chain is TEXT/CHAT MODELS ONLY. The router
+# (model_router.py) sends a plain text prompt and reads response.text — it
+# has no code path for images, audio, or action/robotics outputs. Mixing in
+# non-text models (image generation, TTS, music, robotics/computer-use,
+# Deep Research agent previews) here would not "gracefully fail over" the
+# way a quota error does — it would return a response with no usable .text,
+# which the rest of the app isn't built to handle. Those model families are
+# kept below in separate, clearly-labeled lists (IMAGE_MODEL_CHAIN, and
+# reference-only lists for the others) instead, so they're documented and
+# available to route to specifically (e.g. Image_Create in tools.py already
+# uses IMAGE_MODEL_CHAIN's first entry) without corrupting the main
+# conversational failover chain.
 #
-# NOTE: this list now includes every model currently listed under Google AI
-# Studio's free tier (see gemini_models_list.txt), not just general-purpose
-# text/chat models. That means it also includes image-generation models
-# (e.g. "Nano Banana" variants), TTS models, robotics/computer-use models,
-# and Deep Research / Antigravity agent previews. These do NOT behave like
-# plain chat models — e.g. TTS models expect/return audio, image models
-# return images, etc. — so if the agent sends a normal text prompt to one of
-# these and gets back something it can't use, the router should treat that
-# as a failure and move on to the next entry, same as a quota error. Flash /
-# Flash-Lite text models are kept first in priority order for that reason.
+# Verified against Google's official Gemini API changelog/model docs and
+# Firebase AI Logic model-availability notices, as of end of July 2026:
+#   - Gemini 3.6 Flash and Gemini 3.5 Flash-Lite reached GENERAL AVAILABILITY
+#     on July 21, 2026 — these are now the recommended stable defaults.
+#   - gemini-2.0-flash, gemini-2.0-flash-001, gemini-2.0-flash-lite, and
+#     gemini-2.0-flash-lite-001 were ALL RETIRED June 1, 2026 and return
+#     errors for every request — removed from the chain entirely (not just
+#     commented out) since there's no reason to ever attempt them.
+#   - gemini-3-pro-preview was retired March 9, 2026 in favor of
+#     gemini-3.1-pro-preview.
+#   - As of April 1, 2026, ALL Pro-tier text models are paid-only (no free
+#     tier). Kept as fallbacks for paid accounts; a free-tier account will
+#     simply have them skipped automatically via the zero-quota detection
+#     in model_router.py.
+#   - Heads-up for later maintenance: Google has announced Gemini 2.5 Pro and
+#     2.5 Flash will be retired in October 2026 — if you're reading this
+#     after that date, those two entries likely need removing too.
+#   - "gemini-flash-latest" / "gemini-flash-lite-latest" / "gemini-pro-latest"
+#     are Google's "floating" aliases that always point at the current
+#     recommended release — kept as safety-net fallback entries so the chain
+#     stays useful even if a pinned version name below gets retired before
+#     this file is updated again.
+#   - gemma-* entries are a separate open-weight model family (not part of
+#     the Gemini line) with historically generous but sometimes volatile
+#     free-tier quotas — kept as a last-resort fallback before paid Pro
+#     models, not as a primary choice.
 #
 # This list is also just the DEFAULT — it's fully user-editable at runtime
-# via /settings in the CLI, since which models exist and which are free
-# changes often enough that hardcoding a single "correct" list isn't
-# reliable. /settings lets you add/remove/reorder any model name the Gemini
-# API accepts, and assign specific models to specific ROLES (see
-# MULTI_AGENT_ROLES below) for the multi-agent feature.
+# via /settings in the CLI (including /settings models, which queries your
+# actual API key for the live list Google currently serves it), since which
+# models exist and which are free changes often enough that a hardcoded
+# "correct" list alone isn't reliable long-term.
 _DEFAULT_MODEL_CHAIN = [
-    # --- General-purpose text/chat models (preferred first) ---
     {"name": "gemini-3.6-flash", "max_requests_per_session": 200},
     {"name": "gemini-3.5-flash", "max_requests_per_session": 200},
-    {"name": "gemini-flash-latest", "max_requests_per_session": 200},
-    {"name": "gemini-3-flash-preview", "max_requests_per_session": 200},
-    {"name": "gemini-2.5-flash", "max_requests_per_session": 200},
-    {"name": "gemini-2.0-flash", "max_requests_per_session": 200},
-    {"name": "gemini-2.0-flash-001", "max_requests_per_session": 200},
-    {"name": "gemini-omni-flash-preview", "max_requests_per_session": 200},
     {"name": "gemini-3.5-flash-lite", "max_requests_per_session": 300},
     {"name": "gemini-3.1-flash-lite", "max_requests_per_session": 300},
-    {"name": "gemini-3.1-flash-lite-preview", "max_requests_per_session": 300},
-    {"name": "gemini-flash-lite-latest", "max_requests_per_session": 300},
+    {"name": "gemini-2.5-flash", "max_requests_per_session": 200},
     {"name": "gemini-2.5-flash-lite", "max_requests_per_session": 300},
-    {"name": "gemini-2.0-flash-lite", "max_requests_per_session": 300},
-    {"name": "gemini-2.0-flash-lite-001", "max_requests_per_session": 300},
-    {"name": "gemma-4-26b-a4b-it", "max_requests_per_session": 300},
+    {"name": "gemini-flash-latest", "max_requests_per_session": 200},
+    {"name": "gemini-flash-lite-latest", "max_requests_per_session": 300},
     {"name": "gemma-4-31b-it", "max_requests_per_session": 300},
-
-    # --- Pro-tier text models (paid-only since Apr 1, 2026 — skipped
-    # automatically on free-tier accounts via zero-quota detection) ---
+    {"name": "gemma-4-26b-a4b-it", "max_requests_per_session": 300},
+    {
+        # Paid-only since April 1, 2026 — kept as a fallback for paid
+        # accounts; skipped automatically on free-tier accounts.
+        "name": "gemini-2.5-pro",
+        "max_requests_per_session": 100,
+    },
     {"name": "gemini-pro-latest", "max_requests_per_session": 100},
-    {"name": "gemini-2.5-pro", "max_requests_per_session": 100},
-    {"name": "gemini-3-pro-preview", "max_requests_per_session": 100},
-    {"name": "gemini-3.1-pro-preview", "max_requests_per_session": 100},
-    {"name": "gemini-3.1-pro-preview-customtools", "max_requests_per_session": 100},
+    {
+        # Paid-only, preview.
+        "name": "gemini-3.1-pro-preview",
+        "max_requests_per_session": None,
+    },
+]
 
-    # --- Image generation models ("Nano Banana" family) — return images,
-    # not text; only useful if the agent has an image-handling code path ---
-    {"name": "gemini-2.5-flash-image", "max_requests_per_session": 100},
-    {"name": "gemini-3-pro-image-preview", "max_requests_per_session": 100},
-    {"name": "gemini-3-pro-image", "max_requests_per_session": 100},
-    {"name": "nano-banana-pro-preview", "max_requests_per_session": 100},
-    {"name": "gemini-3.1-flash-image-preview", "max_requests_per_session": 100},
-    {"name": "gemini-3.1-flash-image", "max_requests_per_session": 100},
-    {"name": "gemini-3.1-flash-lite-image", "max_requests_per_session": 100},
+# ---------- Image generation models ("Nano Banana" family) ----------
+# These return IMAGE data, not text — used by tools.Image_Create, never by
+# the main conversational MODEL_CHAIN above. Kept as its own ordered
+# fallback list for the same "try the next one on failure" reasoning.
+IMAGE_MODEL_CHAIN = [
+    "gemini-2.5-flash-image",
+    "gemini-3.1-flash-image",
+    "gemini-3.1-flash-lite-image",
+    "gemini-3-pro-image",
+    "nano-banana-pro-preview",
+]
 
-    # --- TTS / audio models — return audio, not text ---
-    {"name": "gemini-2.5-flash-preview-tts", "max_requests_per_session": 100},
-    {"name": "gemini-2.5-pro-preview-tts", "max_requests_per_session": 100},
-    {"name": "gemini-3.1-flash-tts-preview", "max_requests_per_session": 100},
-
-    # --- Music generation models (Lyria) ---
-    {"name": "lyria-3-clip-preview", "max_requests_per_session": 100},
-    {"name": "lyria-3-pro-preview", "max_requests_per_session": 100},
-
-    # --- Robotics / computer-use / agentic preview models ---
-    {"name": "gemini-robotics-er-1.5-preview", "max_requests_per_session": 100},
-    {"name": "gemini-robotics-er-1.6-preview", "max_requests_per_session": 100},
-    {"name": "gemini-robotics-er-2-preview", "max_requests_per_session": 100},
-    {"name": "gemini-2.5-computer-use-preview-10-2025", "max_requests_per_session": 100},
-    {"name": "antigravity-preview-05-2026", "max_requests_per_session": 100},
-
-    # --- Deep Research previews ---
-    {"name": "deep-research-max-preview-04-2026", "max_requests_per_session": 50},
-    {"name": "deep-research-preview-04-2026", "max_requests_per_session": 50},
-    {"name": "deep-research-pro-preview-12-2025", "max_requests_per_session": 50},
+# ---------- Reference-only: other non-text model families ----------
+# These are NOT wired into any automatic chain in this codebase — there's no
+# tool here that produces/consumes audio, music, robot action sequences, or
+# uses the standalone Deep Research/Antigravity agent frameworks. Listed
+# here purely as an up-to-date reference in case a future tool needs them,
+# so their exact current model-ID strings are documented in one place
+# rather than needing to be re-discovered.
+_REFERENCE_TTS_MODELS = [
+    "gemini-2.5-flash-preview-tts",
+    "gemini-2.5-pro-preview-tts",
+    "gemini-3.1-flash-tts-preview",
+]
+_REFERENCE_MUSIC_MODELS = [
+    "lyria-3-clip-preview",
+    "lyria-3-pro-preview",
+]
+_REFERENCE_ROBOTICS_COMPUTER_USE_MODELS = [
+    "gemini-robotics-er-1.5-preview",
+    "gemini-robotics-er-1.6-preview",
+    "gemini-robotics-er-2-preview",
+    "gemini-2.5-computer-use-preview-10-2025",
+    "antigravity-preview-05-2026",
+]
+_REFERENCE_DEEP_RESEARCH_MODELS = [
+    "deep-research-max-preview-04-2026",
+    "deep-research-preview-04-2026",
+    "deep-research-pro-preview-12-2025",
 ]
 
 # The actual chain used at runtime: the saved override from /settings if one

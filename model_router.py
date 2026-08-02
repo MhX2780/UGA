@@ -66,13 +66,54 @@ def fetch_available_models(api_key: str) -> list:
 
 class ModelRouter:
     def __init__(self, api_key: str):
-        self.client = genai.Client(api_key=api_key)
+        # api_key here is kept as the "currently active" key for backward
+        # compatibility with any external code constructing ModelRouter
+        # directly with a single key — but the router also loads the FULL
+        # configured key pool (config.load_api_key_pool()) so it can rotate
+        # through additional keys on a daily-quota (RPD) exhaustion, which a
+        # single key's quota reset (~24h) can't otherwise recover from. If
+        # the given api_key isn't in the pool (e.g. passed in directly by a
+        # caller rather than loaded from config), it's used as-is and the
+        # pool is only consulted for rotation beyond it.
+        pool = config.load_api_key_pool()
+        if api_key and api_key not in pool:
+            pool = [api_key] + pool
+        self.key_pool = pool or [api_key]
+        self.current_key_index = self.key_pool.index(api_key) if api_key in self.key_pool else 0
+
+        self.client = genai.Client(api_key=self.key_pool[self.current_key_index])
         self.chain = config.MODEL_CHAIN
         self.current_index = 0
         self.request_counts: Dict[str, int] = {m["name"]: 0 for m in self.chain}
         self.switch_log = []  # log of every switch that happened (for transparency)
         self._status_callback = None  # set via set_status_callback; updates a live line instead of print()
         self._load_stats()
+
+    @property
+    def has_multiple_keys(self) -> bool:
+        return len(self.key_pool) > 1
+
+    def _rotate_to_next_key(self) -> bool:
+        """
+        Switches to the next API key in the pool (wrapping around to the
+        first if at the end) and rebuilds the client to use it. Returns True
+        if a different key was actually switched to, False if there's only
+        one key configured (nothing to rotate to). Does NOT reset
+        current_index — the model chain restarts from the top on the new
+        key deliberately, since a fresh key has its own fresh per-model
+        quotas regardless of which model the previous key had settled on.
+        """
+        if not self.has_multiple_keys:
+            return False
+        old_index = self.current_key_index
+        self.current_key_index = (self.current_key_index + 1) % len(self.key_pool)
+        self.client = genai.Client(api_key=self.key_pool[self.current_key_index])
+        self.current_index = 0  # restart the model chain from the top on the new key
+        self._report_status(
+            f"{C.BLUE}Daily quota exhausted on API key #{old_index + 1} — "
+            f"switching to API key #{self.current_key_index + 1} of {len(self.key_pool)}{C.RESET}"
+        )
+        return True
 
     def set_status_callback(self, callback):
         """
@@ -201,6 +242,37 @@ class ModelRouter:
         # Matches both JSON-style '"limit": 0' and free-text 'limit: 0'
         return bool(re.search(r'\blimit["\']?\s*:\s*0\b', combined))
 
+    @staticmethod
+    def _is_daily_quota_error(error: Exception) -> bool:
+        """
+        Distinguishes a DAILY quota exhaustion (RPD — Requests Per Day) from
+        a per-minute rate limit (RPM). This matters because they need
+        completely different handling: an RPM error is worth a short
+        backoff-and-retry (it resets within a minute), but an RPD error
+        resets once every 24 hours — waiting even the longest reasonable
+        backoff is pointless, and the only way to keep working right now is
+        to switch to a different model or a different API key. Google's
+        error payload names the specific quota that was hit (visible in the
+        'quotaId' field), e.g.:
+          - "GenerateRequestsPerDayPerProjectPerModel-FreeTier"  (RPD — daily)
+          - "GenerateRequestsPerMinutePerProjectPerModel-FreeTier" (RPM — per-minute)
+        so this checks for "PerDay" specifically in that identifier rather
+        than guessing from wait-time text (which isn't always present).
+        """
+        details = getattr(error, "details", None)
+        message = getattr(error, "message", None)
+        combined = ""
+        if details:
+            try:
+                combined += json.dumps(details)
+            except TypeError:
+                combined += str(details)
+        if message:
+            combined += " " + str(message)
+        if not combined:
+            combined = str(error)
+        return "PerDay" in combined
+
     def _build_config(self, system_instruction, tools) -> types.GenerateContentConfig:
         """
         Builds the request config. Critically, this explicitly disables the
@@ -231,9 +303,23 @@ class ModelRouter:
 
     def _classify_error(self, model_name: str, error: Exception):
         """
-        Records the failure and decides what to do about it:
-        returns ("retry", wait_seconds) to retry the same model after waiting,
-        or ("switch", None) to move on to the next model immediately.
+        Records the failure and decides what to do about it. Returns one of:
+          ("retry", wait_seconds)  — retry the SAME model after waiting
+                                     (genuine per-minute rate limit — RPM)
+          ("switch", None)        — move to the NEXT MODEL in the chain
+                                     immediately (zero quota for this model,
+                                     or a non-retryable client error)
+          ("switch_key", None)    — the DAILY quota (RPD) for this model was
+                                     hit on the CURRENT API key. Waiting is
+                                     pointless (resets ~24h later), and
+                                     unlike a zero-quota error, this isn't
+                                     about the model at all — it's the KEY's
+                                     daily allowance. If additional API keys
+                                     are configured (config pool), the
+                                     caller should rotate to the next key and
+                                     retry the SAME model chain from the top
+                                     on it, rather than just moving to the
+                                     next model on the same exhausted key.
         """
         self._bump_stat(model_name, "failure")
         short_reason = self._short_error_reason(error)
@@ -243,6 +329,9 @@ class ModelRouter:
             if status == 429 and self._is_zero_quota_error(error):
                 self._report_status(f"{C.BLUE}{model_name}: no quota on this plan, switching model{C.RESET}")
                 return "switch", None
+            elif status == 429 and self._is_daily_quota_error(error):
+                self._report_status(f"{C.BLUE}{model_name}: daily quota (RPD) exhausted{C.RESET}")
+                return "switch_key", None
             elif status == 429:
                 wait = config.RETRY_BACKOFF_BASE
                 self._report_status(f"{C.BLUE}{model_name}: {short_reason}{C.RESET}")
@@ -302,6 +391,13 @@ class ModelRouter:
                 action, wait = self._classify_error(model_name, e)
                 if action == "retry" and attempts < config.RETRIES_PER_MODEL:
                     time.sleep(wait)
+                    continue
+                elif action == "switch_key" and self._rotate_to_next_key():
+                    # Retry the SAME role model on the newly-active key —
+                    # an RPD exhaustion is about the KEY's daily allowance,
+                    # not this specific model, so the model itself is still
+                    # worth trying again once a fresh key is active.
+                    attempts = 0
                     continue
                 else:
                     break
@@ -380,6 +476,9 @@ class ModelRouter:
                 if action == "retry" and attempts < config.RETRIES_PER_MODEL:
                     time.sleep(wait)
                     continue
+                elif action == "switch_key" and self._rotate_to_next_key():
+                    attempts = 0
+                    continue
                 else:
                     break
 
@@ -436,6 +535,7 @@ class ModelRouter:
             gen_config = self._build_config(system_instruction, tools)
             attempts = 0
             last_error = None
+            switched_key = False
 
             while attempts < config.RETRIES_PER_MODEL:
                 attempts += 1
@@ -454,8 +554,18 @@ class ModelRouter:
                     if action == "retry" and attempts < config.RETRIES_PER_MODEL:
                         time.sleep(wait)
                         continue
+                    elif action == "switch_key" and self._rotate_to_next_key():
+                        # Retry the SAME model on the new key rather than
+                        # falling through to "advance to next model" below —
+                        # a fresh key may well have quota for this exact
+                        # model even though the previous key didn't.
+                        switched_key = True
+                        break
                     else:
                         break  # give up on this model, fall through to switch logic
+
+            if switched_key:
+                continue
 
             if self._has_next_model():
                 self._advance_model(reason=self._short_error_reason(last_error) if last_error else "repeated failure")
@@ -481,6 +591,7 @@ class ModelRouter:
             gen_config = self._build_config(system_instruction, tools)
             attempts = 0
             last_error = None
+            switched_key = False
 
             while attempts < config.RETRIES_PER_MODEL:
                 attempts += 1
@@ -511,8 +622,14 @@ class ModelRouter:
                     if action == "retry" and attempts < config.RETRIES_PER_MODEL:
                         time.sleep(wait)
                         continue
+                    elif action == "switch_key" and self._rotate_to_next_key():
+                        switched_key = True
+                        break
                     else:
                         break
+
+            if switched_key:
+                continue
 
             if self._has_next_model():
                 self._advance_model(reason=self._short_error_reason(last_error) if last_error else "repeated failure")
