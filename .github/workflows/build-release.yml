@@ -66,6 +66,9 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -77,6 +80,17 @@ jobs:
           find artifacts -type f -exec cp {} release/ \;
           ls -la release
 
+      - name: Generate version.txt
+        id: version
+        run: |
+          UPDATE_DATE=$(date -u +"%Y-%m-%d %H:%M:%S UTC")
+          COMMIT_SHA=$(git rev-parse --short HEAD)
+          echo "$UPDATE_DATE" > release/version.txt
+          echo "commit: $COMMIT_SHA" >> release/version.txt
+          echo "update_date=$UPDATE_DATE" >> "$GITHUB_OUTPUT"
+          echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+          cat release/version.txt
+
       - name: Publish to Release
         uses: softprops/action-gh-release@v2
         with:
@@ -84,5 +98,11 @@ jobs:
           name: Professional
           files: release/*
           make_latest: true
+          body: |
+            **Latest Update:** ${{ steps.version.outputs.update_date }}
+            **Commit:** ${{ steps.version.outputs.commit_sha }}
+
+            This release is automatically updated on every push to `main`.
+            Check `version.txt` in the assets below to detect new updates programmatically.
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
