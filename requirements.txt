@@ -1,6 +1,7 @@
 google-genai>=0.8.0
 pyyaml>=6.0
 Pillow>=10.0
+requests>=2.31.0
 
 # Optional — only needed if you configure a Claude or ChatGPT model for a
 # multi-agent role via /settings role (see providers.py). Not required for

@@ -61,7 +61,7 @@ SLASH_COMMANDS = [
     "/help", "/clear", "/remember", "/memory", "/forget", "/undo", "/tree",
     "/ps", "/log", "/clearlog", "/image", "/force_review",
     "/multi-agent", "/settings",
-    "/stats", "/workspace", "/resetkey", "/keys", "/puterJS", "/exit", "/quit",
+    "/stats", "/workspace", "/resetkey", "/keys", "/puterJS", "/free", "/exit", "/quit",
 ]
 
 COMMAND_HINTS = {
@@ -84,6 +84,7 @@ COMMAND_HINTS = {
     "/resetkey": "delete the saved API key",
     "/keys": "manage multiple Gemini API keys (list/add/remove)",
     "/puterJS": "connect Puter.js for free access to 500+ AI models",
+    "/free": "list Puter.js models ending in \"free\" and assign one to a role",
     "/exit": "quit the program",
     "/quit": "quit the program",
 }
@@ -161,7 +162,7 @@ def print_help():
         ("/resetkey", "delete the saved API key"),
         ("/keys", "manage multiple Gemini API keys (list/add/remove)"),
         ("/puterJS", "connect Puter.js for free access to 500+ AI models"),
-        ("/puterJS", "connect Puter.js for free access to 500+ AI models"),
+        ("/free", "list Puter.js models ending in \"free\" and assign one to a role"),
         ("/exit, /quit", "quit the program"),
     ]
     lines = [f"{C.CYAN}{cmd:<16}{C.RESET} {desc}" for cmd, desc in rows]
@@ -599,6 +600,61 @@ def handle_puterjs_command():
     print(draw_box(f"Puter.js connected — {len(models)} model(s) available", lines, color=C.GREEN))
 
 
+def handle_free_command(agent):
+    """
+    /free — lists only the Puter.js models whose id ends in "free" (e.g.
+    some providers expose a no-cost/limited tier via a name ending in
+    ":free" or "-free" through Puter), and lets the user pick one with an
+    arrow-key menu to immediately assign it to a multi-agent role.
+
+    Requires a Puter token to already be configured (via /puterJS or
+    /settings provider puter <token>) — this command only filters/selects
+    from Puter's model list, it doesn't add a new provider.
+    """
+    if not providers.has_provider_key("puter"):
+        print(f"{C.YELLOW}⚠️  No Puter token configured yet — use /puterJS first.{C.RESET}")
+        return
+
+    print(f"{C.DIM}Fetching free-tier Puter models...{C.RESET}")
+    try:
+        free_models = providers.puter_list_free_models()
+    except Exception as e:
+        print(f"{C.RED}❌ Could not fetch Puter models: {e}{C.RESET}")
+        return
+
+    if not free_models:
+        print(f"{C.YELLOW}⚠️  No models ending in \"free\" were found in your Puter model list.{C.RESET}")
+        return
+
+    lines = [f"  {C.CYAN}{m}{C.RESET}" for m in free_models]
+    print(draw_box(f"Free Puter models ({len(free_models)})", lines, color=C.GREEN))
+
+    choice = select_menu(
+        "🆓 Assign a free model to a role",
+        free_models,
+        None,
+    )
+    if choice is None:
+        print(f"{C.DIM}Cancelled.{C.RESET}")
+        return
+
+    model_name = free_models[choice]
+    role_names = list(config.MULTI_AGENT_ROLES.keys())
+    role_choice = select_menu(
+        f"Assign '{model_name}' to which role?",
+        role_names,
+        None,
+    )
+    if role_choice is None:
+        print(f"{C.DIM}Cancelled.{C.RESET}")
+        return
+
+    role = role_names[role_choice]
+    config.MULTI_AGENT_ROLES[role] = model_name
+    _persist_current_settings()
+    print(f"{C.GREEN}✅ Role '{role}' assigned to free model '{model_name}'.{C.RESET}")
+
+
 def print_keys_menu(agent):
     """
     Shows every configured Gemini API key (masked — never the full secret),
@@ -696,11 +752,21 @@ def print_settings_menu(agent):
     lines.append(f"  Multi-agent mode: {'ON' if config.MULTI_AGENT_ENABLED else 'OFF'} (toggle with /multi-agent)")
 
     lines.append("")
+    lines.append(f"{C.BOLD}Puter.js{C.RESET}:")
+    lines.append(f"  Use in chat: {'ON' if config.PUTER_CHAT_ENABLED else 'OFF'} "
+                  f"{C.DIM}(toggle with /settings puter chat on|off — plain text only, "
+                  f"no tool access yet; may be added later){C.RESET}")
+    lines.append(f"  Free models only: {'ON' if config.PUTER_FREE_ONLY else 'OFF'} "
+                  f"{C.DIM}(toggle with /settings puter free on|off){C.RESET}")
+
+    lines.append("")
     lines.append(f"{C.DIM}To change things:{C.RESET}")
     lines.append(f"  {C.CYAN}/settings models{C.RESET}          list every model your API key can use")
     lines.append(f"  {C.CYAN}/settings role <role> <model>{C.RESET}  assign a model to a role, e.g.")
     lines.append(f"                                 /settings role planner gemini-2.5-pro")
     lines.append(f"  {C.CYAN}/settings chain <m1,m2,...>{C.RESET}    replace the failover chain order")
+    lines.append(f"  {C.CYAN}/settings puter chat on|off{C.RESET}    use Puter.js models in main chat (plain text only, no tools)")
+    lines.append(f"  {C.CYAN}/settings puter free on|off{C.RESET}    restrict Puter.js calls to models with 'free' in the name")
 
     print(draw_box("Settings", lines, color=C.TEAL))
 
@@ -811,6 +877,29 @@ def handle_settings_subcommand(agent, rest: str):
         key_value = parts[2].strip()
         providers.save_provider_api_key(provider_id, key_value)
         print(f"{C.GREEN}✅ {providers.PROVIDERS[provider_id]['label']} key saved.{C.RESET}")
+        return
+
+    if sub == "puter":
+        if len(parts) < 3 or parts[1].strip().lower() not in ("chat", "free") or parts[2].strip().lower() not in ("on", "off"):
+            print(f"{C.YELLOW}⚠️  Usage: /settings puter chat on|off   or   /settings puter free on|off{C.RESET}")
+            return
+        toggle, state = parts[1].strip().lower(), parts[2].strip().lower() == "on"
+        if toggle == "chat":
+            config.PUTER_CHAT_ENABLED = state
+            _persist_current_settings()
+            if state:
+                print(f"{C.GREEN}✅ Puter.js models can now be used in the main chat.{C.RESET} "
+                      f"{C.DIM}Note: this is plain-text chat only — Puter has no access to tools "
+                      f"(file edits, commands, etc.) for now; that may be added later.{C.RESET}")
+            else:
+                print(f"{C.GREEN}✅ Puter.js is now limited to /puterJS and /free only (not used in main chat).{C.RESET}")
+        else:  # free
+            config.PUTER_FREE_ONLY = state
+            _persist_current_settings()
+            if state:
+                print(f"{C.GREEN}✅ Puter.js calls are now restricted to models with 'free' in the name.{C.RESET}")
+            else:
+                print(f"{C.GREEN}✅ Puter.js calls can now use any model from your account, not just free ones.{C.RESET}")
         return
 
     print(f"{C.YELLOW}⚠️  Unknown /settings subcommand '{sub}'. Try /settings for the menu.{C.RESET}")
@@ -1137,6 +1226,10 @@ def main():
 
         if user_input == "/puterJS":
             handle_puterjs_command()
+            continue
+
+        if user_input == "/free":
+            handle_free_command(agent)
             continue
 
         # ---------- unrecognized slash command ----------

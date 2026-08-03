@@ -664,6 +664,44 @@ def stop_background_process(pid: int) -> str:
         return f"❌ Failed to stop PID {pid}: {e}"
 
 
+def wait_process(pid: int, timeout: int = 60, poll_interval: float = 1.0) -> str:
+    """
+    Waits (blocks) until a background process finishes, or until the timeout
+    is reached — whichever comes first. Useful when a later step depends on
+    the background process actually being done (e.g. "run the build, then
+    wait for it to finish, then check the output") instead of just firing it
+    and moving on.
+
+    Args:
+        pid: the process ID to wait for (as returned by start_background_process
+             or run_command's background path)
+        timeout: max seconds to wait before giving up and returning control
+                 (default 60)
+        poll_interval: seconds between liveness checks (default 1.0)
+    """
+    registry = _load_bg_registry()
+    if str(pid) not in registry and pid not in _background_processes:
+        return f"❌ No known background process with PID {pid}."
+
+    if not _is_pid_alive(pid):
+        return f"✅ PID {pid} has already finished (nothing to wait for)."
+
+    waited = 0.0
+    while waited < timeout:
+        if not _is_pid_alive(pid):
+            info = registry.get(str(pid), {})
+            log_hint = f" (log: {info['log_file']})" if info.get("log_file") else ""
+            return f"✅ PID {pid} finished after ~{waited:.1f}s.{log_hint} Use read_background_log({pid}) to see its output."
+        time.sleep(poll_interval)
+        waited += poll_interval
+
+    return (
+        f"⏳ Timed out after {timeout}s — PID {pid} is still running. "
+        f"Call wait_process again to keep waiting, or use read_background_log({pid}) "
+        f"to check progress so far."
+    )
+
+
 import platform
 import shlex
 
@@ -2899,6 +2937,7 @@ ALL_TOOLS = [
     list_background_processes,
     read_background_log,
     stop_background_process,
+    wait_process,
     git_clone,
     git_fetcher,
     git_diff,

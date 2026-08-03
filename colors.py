@@ -97,6 +97,59 @@ def _visible_len(s: str) -> int:
     return width
 
 
+def _strip_ansi(s: str) -> str:
+    """Removes ANSI escape codes only (keeps the actual text/emoji intact),
+    used when we need to slice a string by visible characters without
+    corrupting color codes."""
+    return re.sub(r"\033\[[0-9;?]*[a-zA-Z]", "", s)
+
+
+def _wrap_line(line: str, inner_w: int) -> list:
+    """
+    Splits a single body line into one or more chunks that each fit within
+    inner_w visible columns, breaking on whitespace where possible so words
+    aren't cut mid-way. This is what keeps the box's right-hand border
+    aligned even when a line (e.g. a long model name or error message) is
+    wider than the box — instead of overflowing past the border, it wraps
+    onto additional lines inside the same box.
+
+    Note: this strips ANSI color codes from the line before measuring/
+    wrapping (color codes have zero visible width but their presence between
+    characters makes plain slicing unsafe). Colored `lines` passed to
+    draw_box will lose their color on wrap; callers that need color AND long
+    text should pre-wrap and pass already-short lines instead.
+    """
+    if inner_w < 1:
+        inner_w = 1
+    plain = _strip_ansi(line)
+    if _visible_len(plain) <= inner_w:
+        return [line]
+
+    words = plain.split(" ")
+    chunks = []
+    current = ""
+    for word in words:
+        candidate = f"{current} {word}".strip() if current else word
+        if _visible_len(candidate) <= inner_w:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            # A single word longer than inner_w must be hard-split by
+            # character, since there's no whitespace to break on.
+            while _visible_len(word) > inner_w:
+                # slice conservatively by plain character count; visible
+                # width only exceeds character count for wide/emoji chars,
+                # so this stays within bounds even if not perfectly tight
+                cut = word[:inner_w]
+                chunks.append(cut)
+                word = word[inner_w:]
+            current = word
+    if current:
+        chunks.append(current)
+    return chunks or [""]
+
+
 def draw_box(title: str, lines, color: str = None, width: int = None) -> str:
     """
     Renders a box-drawn panel with a title and body lines, e.g.:
@@ -107,11 +160,22 @@ def draw_box(title: str, lines, color: str = None, width: int = None) -> str:
         ╰────────────────────────╯
 
     `lines` can contain ANSI codes; visible-length is computed by stripping
-    escape sequences so borders still line up.
+    escape sequences so borders still line up. Any line (or the title)
+    wider than the box wraps onto additional lines instead of overflowing
+    past the right border, so the box stays a consistent width front to
+    back regardless of content length.
     """
     color = color or C.CYAN
     w = width or term_width()
     inner_w = w - 4  # account for "│ " + " │"
+
+    # If the title itself is too long for the box, widen the box to fit it
+    # (up to the terminal width) rather than letting the top border overflow.
+    title_visible = _visible_len(title) if title else 0
+    min_w_for_title = title_visible + 6  # "╭─ " + " ─╮" + a little breathing room
+    if title and min_w_for_title > w:
+        w = min(min_w_for_title, term_width())
+        inner_w = w - 4
 
     top_title = f" {title} " if title else ""
     top_fill = "─" * max(0, w - 2 - _visible_len(top_title))
@@ -119,8 +183,9 @@ def draw_box(title: str, lines, color: str = None, width: int = None) -> str:
 
     body = []
     for line in lines:
-        pad = max(0, inner_w - _visible_len(line))
-        body.append(f"{color}│{C.RESET} {line}{' ' * pad} {color}│{C.RESET}")
+        for wrapped in _wrap_line(line, inner_w):
+            pad = max(0, inner_w - _visible_len(wrapped))
+            body.append(f"{color}│{C.RESET} {wrapped}{' ' * pad} {color}│{C.RESET}")
 
     bottom = f"{color}╰{'─' * (w - 2)}╯{C.RESET}"
     return "\n".join([top] + body + [bottom])

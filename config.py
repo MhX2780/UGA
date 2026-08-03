@@ -311,6 +311,10 @@ IMAGE_MODEL_CHAIN = [
     "gemini-3.1-flash-lite-image",
     "gemini-3-pro-image",
     "nano-banana-pro-preview",
+    # Preview-stage siblings of the stable entries above — kept last since
+    # "-preview" model IDs are less stable/guaranteed than GA releases.
+    "gemini-3.1-flash-image-preview",
+    "gemini-3-pro-image-preview",
 ]
 
 # ---------- Reference-only: other non-text model families ----------
@@ -324,6 +328,15 @@ _REFERENCE_TTS_MODELS = [
     "gemini-2.5-flash-preview-tts",
     "gemini-2.5-pro-preview-tts",
     "gemini-3.1-flash-tts-preview",
+]
+# Newer preview-stage text/chat model IDs, not yet promoted into
+# _DEFAULT_MODEL_CHAIN above (kept as reference until they reach GA, at
+# which point they'd move up into the main chain like 3.5/3.6-flash did).
+_REFERENCE_PREVIEW_TEXT_MODELS = [
+    "gemini-3-flash-preview",
+    "gemini-3.1-flash-lite-preview",
+    "gemini-3.1-pro-preview-customtools",  # gemini-3.1-pro-preview tuned for custom tool use
+    "gemini-omni-flash-preview",
 ]
 _REFERENCE_MUSIC_MODELS = [
     "lyria-3-clip-preview",
@@ -356,6 +369,20 @@ _DEFAULT_MULTI_AGENT_ROLES = {
 MULTI_AGENT_ROLES = _saved_settings.get("multi_agent_roles", _DEFAULT_MULTI_AGENT_ROLES)
 MULTI_AGENT_ENABLED = _saved_settings.get("multi_agent_enabled", False)
 
+# ---------- Puter.js chat integration ----------
+# If ON, Puter.js models are allowed to be used for plain-text replies in the
+# main chat, not just via /puterJS or /free for manual model picking.
+# IMPORTANT: tool calling (file edits, running commands, etc.) is NOT wired
+# up for Puter — the whole tools.ALL_TOOLS pipeline in agent.py only talks to
+# Gemini's function-calling API. When a Puter model answers in chat it does
+# so WITHOUT access to any tools. Tool support for Puter may be added later.
+PUTER_CHAT_ENABLED = _saved_settings.get("puter_chat_enabled", False)
+
+# If ON, any call routed to the "puter" provider is restricted to models whose
+# id ends in "free" (or contains "free"), regardless of which Puter model was
+# otherwise selected. This keeps usage on Puter's no-cost tier only.
+PUTER_FREE_ONLY = _saved_settings.get("puter_free_only", False)
+
 
 def get_current_settings_snapshot() -> dict:
     """
@@ -369,6 +396,8 @@ def get_current_settings_snapshot() -> dict:
         "model_chain": MODEL_CHAIN,
         "multi_agent_roles": MULTI_AGENT_ROLES,
         "multi_agent_enabled": MULTI_AGENT_ENABLED,
+        "puter_chat_enabled": PUTER_CHAT_ENABLED,
+        "puter_free_only": PUTER_FREE_ONLY,
     }
 
 # Number of retry attempts on the same model before moving to the next one

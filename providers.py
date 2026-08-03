@@ -169,8 +169,25 @@ def _openai_generate_stream(model_name: str, prompt: str, system_instruction: Op
 
 # ---------------- Puter.js (free, user-pays; 500+ models via one token) ----------------
 
+def _enforce_puter_free_only(model_name: str):
+    """
+    If the "Use Free Models Only (Puter.js)" setting is on, blocks any Puter
+    call to a model that doesn't look free (id doesn't end with/contain
+    "free"). Raises instead of silently swapping models, so the caller finds
+    out immediately rather than getting a surprise model in the response.
+    """
+    from config import PUTER_FREE_ONLY
+    if PUTER_FREE_ONLY and "free" not in model_name.lower():
+        raise RuntimeError(
+            f"'{model_name}' is blocked by the \"Use Free Models Only (Puter.js)\" "
+            f"setting (model id doesn't contain \"free\"). Pick a free model via "
+            f"/free, or turn the setting off with /settings puter free off."
+        )
+
+
 def _puter_generate(model_name: str, prompt: str, system_instruction: Optional[str] = None) -> str:
     import openai
+    _enforce_puter_free_only(model_name)
     token = load_provider_api_key("puter")
     if not token:
         raise RuntimeError(
@@ -190,6 +207,7 @@ def _puter_generate(model_name: str, prompt: str, system_instruction: Optional[s
 
 def _puter_generate_stream(model_name: str, prompt: str, system_instruction: Optional[str] = None) -> Iterator[str]:
     import openai
+    _enforce_puter_free_only(model_name)
     token = load_provider_api_key("puter")
     if not token:
         raise RuntimeError(
@@ -210,21 +228,69 @@ def _puter_generate_stream(model_name: str, prompt: str, system_instruction: Opt
             yield delta
 
 
+PUTER_MODELS_ENDPOINT = "https://api.puter.com/puterai/chat/models/details"
+
+
 def puter_list_models() -> list:
     """
-    Fetches the list of models currently available through Puter's
-    OpenAI-compatible endpoint for the configured token. Used by
-    /settings provider puter models in the CLI so the user can see actual
-    current model IDs (e.g. "gpt-4o", "claude-sonnet-4-5", "deepseek-chat")
-    rather than guessing names.
+    Fetches the list of models currently available through Puter for the
+    configured token. Used by /settings provider puter models and /puterJS
+    in the CLI so the user can see actual current model IDs (e.g. "gpt-4o",
+    "claude-sonnet-4-5", "deepseek-chat") rather than guessing names.
+
+    Important: Puter does NOT implement an OpenAI-compatible /v1/models
+    endpoint — calling client.models.list() against PUTER_BASE_URL (as an
+    earlier version of this function did) hits a route that simply doesn't
+    exist on Puter's backend and returns 404 Not Found. Chat completions
+    (chat.completions.create, used elsewhere in this module) ARE OpenAI-
+    compatible and work fine; listing models is not, and needs Puter's own
+    endpoint instead. So this function talks to Puter directly over
+    `requests` rather than going through the `openai` SDK/base_url.
     """
-    import openai
     token = load_provider_api_key("puter")
     if not token:
         raise RuntimeError("No Puter auth token configured.")
-    client = openai.OpenAI(api_key=token, base_url=PUTER_BASE_URL)
-    response = client.models.list()
-    return [m.id for m in response.data]
+    import requests
+    response = requests.get(
+        PUTER_MODELS_ENDPOINT,
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=15,
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    # Puter's response shape has varied across versions/endpoints seen in
+    # the wild (a bare list, {"models": [...]}, or {"data": [...]}), and
+    # each model entry may be a plain string id or a dict with an "id"/
+    # "name" field. Normalize defensively rather than assuming one shape.
+    if isinstance(data, dict):
+        entries = data.get("models") or data.get("data") or []
+    elif isinstance(data, list):
+        entries = data
+    else:
+        entries = []
+
+    model_ids = []
+    for entry in entries:
+        if isinstance(entry, str):
+            model_ids.append(entry)
+        elif isinstance(entry, dict):
+            model_id = entry.get("id") or entry.get("name")
+            if model_id:
+                model_ids.append(model_id)
+    return model_ids
+
+
+def puter_list_free_models() -> list:
+    """
+    Same as puter_list_models(), but filtered to only model IDs ending in
+    "free" (case-insensitive), e.g. names like "...:free" or "...-free" that
+    some providers exposed through Puter use to mark a no-cost/limited tier.
+    Used by the /free command so the user can quickly see and pick from only
+    the free-tier models without scrolling through the full 500+ list.
+    """
+    all_models = puter_list_models()
+    return [m for m in all_models if m.lower().rstrip().endswith("free")]
 
 
 # ---------------- unified entrypoints ----------------
