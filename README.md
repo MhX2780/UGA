@@ -210,5 +210,4 @@ hardened multi-tenant security boundary — don't point it at anything you
 don't trust the model to have full read/write access to within the workspace.
 
 ## License
-
-No license specified — add one appropriate for your use case.
+See the license 
