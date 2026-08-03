@@ -5,11 +5,10 @@ Gemini CLI or Claude Code, built from scratch with a focus on **persistent
 memory**, **automatic model failover**, and a large toolbox for real file/code
 work, all in a single-file-per-concern Python codebase with no heavyweight
 framework dependencies.
-
 ```
 ╭ 🤖 ────────────────────────────────────────────────────────────────────────╮
 │ Gemini Agent · CLI                                                         │
-│ Persistent memory · automatic model switching · live file activity        │
+│ Persistent memory · automatic model switching · live file activity         │
 ╰─────────────────────────────────────────────────────────────────────────────╯
 ```
 
