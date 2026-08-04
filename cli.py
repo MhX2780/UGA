@@ -60,8 +60,8 @@ logging.getLogger("google_genai.types").setLevel(logging.ERROR)
 SLASH_COMMANDS = [
     "/help", "/clear", "/remember", "/memory", "/forget", "/undo", "/tree",
     "/ps", "/log", "/clearlog", "/image", "/force_review",
-    "/multi-agent", "/settings",
-    "/stats", "/workspace", "/resetkey", "/keys", "/puterJS", "/free", "/exit", "/quit",
+    "/multi-agent", "/settings", "/model",
+    "/stats", "/workspace", "/resetkey", "/keys", "/puterJS", "/free", "/deepresearch", "/exit", "/quit",
 ]
 
 COMMAND_HINTS = {
@@ -79,15 +79,36 @@ COMMAND_HINTS = {
     "/force_review": "force the Agent to read and understand every file",
     "/multi-agent": "toggle multi-agent mode (plan/execute/review team) on or off",
     "/settings": "view or change model chain, roles, and multi-agent settings",
+    "/model": "switch this session between Gemini and a Puter.js model [BETA]",
     "/stats": "model usage report and switches",
     "/workspace": "show the workspace path",
     "/resetkey": "delete the saved API key",
     "/keys": "manage multiple Gemini API keys (list/add/remove)",
     "/puterJS": "connect Puter.js for free access to 500+ AI models",
     "/free": "list Puter.js models ending in \"free\" and assign one to a role",
+    "/deepresearch": "<question> — run Google AI Studio's Deep Research agent",
     "/exit": "quit the program",
     "/quit": "quit the program",
 }
+
+
+def _clean_user_input(raw: str) -> str:
+    """
+    Strips invisible Unicode formatting/control characters (RTL mark U+200F,
+    LTR mark U+200E, zero-width space/joiner/non-joiner, BOM) from the start
+    and end of the input, on top of a normal .strip().
+
+    Why this matters: on RTL-aware terminals/keyboards (common when typing
+    Arabic), an invisible RTL mark is frequently auto-inserted right before
+    or after a typed character like '/' — completely invisible to the user,
+    so "/" LOOKS identical whether or not it happened. Without stripping
+    this, user_input would actually be "\u200f/" instead of "/", which
+    fails every startswith("/")/== "/" check in this file (slash-suggestion
+    hint, /exit, /settings, etc. would all silently stop matching) even
+    though the user typed exactly what they intended to.
+    """
+    invisible_chars = "\u200e\u200f\u200b\u200c\u200d\ufeff"
+    return raw.strip().strip(invisible_chars).strip()
 
 
 def _setup_slash_completion():
@@ -157,12 +178,14 @@ def print_help():
         ("/force_review", "force reading/understanding every project file"),
         ("/multi-agent", "toggle the plan/execute/review team on or off"),
         ("/settings", "view or change models, roles, multi-agent settings"),
+        ("/model", "switch this session between Gemini and a Puter.js model [BETA]"),
         ("/stats", "model usage report and automatic switches"),
         ("/workspace", "show the workspace path"),
         ("/resetkey", "delete the saved API key"),
         ("/keys", "manage multiple Gemini API keys (list/add/remove)"),
         ("/puterJS", "connect Puter.js for free access to 500+ AI models"),
         ("/free", "list Puter.js models ending in \"free\" and assign one to a role"),
+        ("/deepresearch <q>", "run Google AI Studio's Deep Research agent on a question"),
         ("/exit, /quit", "quit the program"),
     ]
     lines = [f"{C.CYAN}{cmd:<16}{C.RESET} {desc}" for cmd, desc in rows]
@@ -655,6 +678,132 @@ def handle_free_command(agent):
     print(f"{C.GREEN}✅ Role '{role}' assigned to free model '{model_name}'.{C.RESET}")
 
 
+def handle_deepresearch_command(agent, query: str):
+    """
+    /deepresearch <question> — runs Google AI Studio's Deep Research model
+    (config.DEEP_RESEARCH_MODEL) on the given question and prints the
+    resulting long-form, cited report.
+
+    This is a genuinely different capability from the normal chat models:
+    Deep Research autonomously plans a multi-step web-research strategy,
+    issues its own searches, and synthesizes a report — it is not just "the
+    normal model with a research prompt". Because it can take noticeably
+    longer than a normal chat turn (no meaningful partial-output streaming
+    for this model type), no live status/spinner is shown beyond a single
+    "researching..." message — see model_router.run_deep_research()'s
+    docstring for why this deliberately bypasses the normal ModelRouter
+    failover chain.
+    """
+    if not query:
+        print(f"{C.YELLOW}⚠️  Usage: /deepresearch <question or topic>{C.RESET}")
+        print(f"{C.DIM}   Example: /deepresearch What are the latest advances in solid-state batteries?{C.RESET}")
+        print(f"{C.DIM}   Model used: {config.DEEP_RESEARCH_MODEL}  "
+              f"(change with /settings deepresearch model <model-id>){C.RESET}")
+        return
+
+    api_key = config.GEMINI_API_KEY or config.load_saved_api_key()
+    if not api_key:
+        print(f"{C.RED}❌ No Gemini API key configured — Deep Research requires Google AI Studio access.{C.RESET}")
+        return
+
+    print(f"{C.MAGENTA}🔎 Running Deep Research ({config.DEEP_RESEARCH_MODEL})... "
+          f"this can take a while for thorough topics.{C.RESET}")
+    try:
+        report_text = model_router.run_deep_research(api_key, query)
+    except Exception as e:
+        print(f"{C.RED}❌ Deep Research failed: {e}{C.RESET}")
+        print(f"{C.DIM}   Note: Deep Research models may not be enabled for every API key/tier — "
+              f"check availability in Google AI Studio, or try a different model with "
+              f"/settings deepresearch model <model-id>.{C.RESET}")
+        return
+
+    print(draw_box("🔎 Deep Research Report", [render_markdown(report_text)], color=C.MAGENTA))
+
+
+def handle_model_command(agent, args: str, current_puter_model: Optional[str]) -> Optional[str]:
+    """
+    /model — session-only quick switch between Gemini (the default chain)
+    and a single Puter.js model [BETA], for the rest of this conversation
+    (or until changed again / the app restarts — this is NOT persisted to
+    disk like /settings changes, since it's meant as a "just for now"
+    override rather than a standing preference).
+
+    Usage:
+        /model                    — show the current active model
+        /model gemini             — switch back to Gemini (the default)
+        /model puter               — pick a Puter model interactively from
+                                      an arrow-key menu (requires a Puter
+                                      token; requires /settings puter tools
+                                      on and /settings puter chat on to
+                                      actually take effect, same as the
+                                      puter_model parameter everywhere else
+                                      in this app — checked and warned
+                                      about here if not yet on)
+        /model puter <model-id>   — switch directly to a named Puter model
+                                      without the picker menu
+
+    Returns the new current_puter_model value (None means "use Gemini") —
+    the caller (main()'s loop) stores this and passes it into
+    _send_and_print() for every subsequent message until /model changes it
+    again.
+    """
+    arg_parts = args.strip().split(maxsplit=1)
+    sub = arg_parts[0].lower() if arg_parts else ""
+
+    if not sub:
+        if current_puter_model:
+            print(f"{C.CYAN}Active model: {C.BOLD}{current_puter_model}{C.RESET} {C.DIM}(via Puter.js, BETA){C.RESET}")
+        else:
+            print(f"{C.CYAN}Active model: {C.BOLD}{agent.router.current_model_name}{C.RESET} {C.DIM}(Gemini){C.RESET}")
+        print(f"{C.DIM}Use /model gemini or /model puter [model-id] to switch.{C.RESET}")
+        return current_puter_model
+
+    if sub == "gemini":
+        if current_puter_model is None:
+            print(f"{C.DIM}Already using Gemini.{C.RESET}")
+        else:
+            print(f"{C.GREEN}✅ Switched back to Gemini for this session.{C.RESET}")
+        return None
+
+    if sub == "puter":
+        if not providers.has_provider_key("puter"):
+            print(f"{C.YELLOW}⚠️  No Puter token configured yet — use /puterJS first.{C.RESET}")
+            return current_puter_model
+        if not (config.PUTER_CHAT_ENABLED and config.PUTER_TOOL_CALLING_ENABLED):
+            print(f"{C.YELLOW}⚠️  /model puter also needs both of these turned on to actually take effect:{C.RESET}")
+            print(f"{C.YELLOW}   /settings puter chat on{C.RESET}")
+            print(f"{C.YELLOW}   /settings puter tools on   {C.DIM}(BETA){C.RESET}")
+            print(f"{C.DIM}   You can still pick a model now — it just won't be used until those are on.{C.RESET}")
+
+        explicit_model = arg_parts[1].strip() if len(arg_parts) > 1 else None
+        if explicit_model:
+            model_name = explicit_model
+        else:
+            print(f"{C.DIM}Fetching your Puter models...{C.RESET}")
+            try:
+                available_models = providers.puter_list_models()
+            except Exception as e:
+                print(f"{C.RED}❌ Could not fetch Puter models: {e}{C.RESET}")
+                return current_puter_model
+            if not available_models:
+                print(f"{C.YELLOW}⚠️  No models found in your Puter account.{C.RESET}")
+                return current_puter_model
+            choice = select_menu(f"🧪 Pick a Puter.js model for this session [BETA]", available_models, None)
+            if choice is None:
+                print(f"{C.DIM}Cancelled.{C.RESET}")
+                return current_puter_model
+            model_name = available_models[choice]
+
+        print(f"{C.MAGENTA}🧪 [BETA]{C.RESET} {C.GREEN}Switched to Puter.js model "
+              f"'{model_name}' for this session.{C.RESET}")
+        print(f"{C.DIM}   May not support tool calling/vision reliably — see /settings puter for details.{C.RESET}")
+        print(f"{C.DIM}   Use /model gemini to switch back.{C.RESET}")
+        return model_name
+
+    print(f"{C.YELLOW}⚠️  Usage: /model | /model gemini | /model puter [model-id]{C.RESET}")
+    return current_puter_model
+
+
 def print_keys_menu(agent):
     """
     Shows every configured Gemini API key (masked — never the full secret),
@@ -754,10 +903,39 @@ def print_settings_menu(agent):
     lines.append("")
     lines.append(f"{C.BOLD}Puter.js{C.RESET}:")
     lines.append(f"  Use in chat: {'ON' if config.PUTER_CHAT_ENABLED else 'OFF'} "
-                  f"{C.DIM}(toggle with /settings puter chat on|off — plain text only, "
-                  f"no tool access yet; may be added later){C.RESET}")
+                  f"{C.DIM}(toggle with /settings puter chat on|off){C.RESET}")
     lines.append(f"  Free models only: {'ON' if config.PUTER_FREE_ONLY else 'OFF'} "
                   f"{C.DIM}(toggle with /settings puter free on|off){C.RESET}")
+    lines.append(f"  Tool calling {C.MAGENTA}[BETA]{C.RESET}: {'ON' if config.PUTER_TOOL_CALLING_ENABLED else 'OFF'} "
+                  f"{C.DIM}(toggle with /settings puter tools on|off){C.RESET}")
+    if config.PUTER_TOOL_CALLING_ENABLED:
+        lines.append(f"    {C.YELLOW}⚠️  Beta feature — may not work on all Puter models. Some models{C.RESET}")
+        lines.append(f"    {C.YELLOW}   may ignore tools or return malformed tool calls.{C.RESET}")
+    lines.append(f"  Image fallback {C.MAGENTA}[BETA]{C.RESET}: {'ON' if config.PUTER_IMAGE_TOOLS_ENABLED else 'OFF'} "
+                  f"{C.DIM}(toggle with /settings puter images on|off){C.RESET}")
+    if config.PUTER_IMAGE_TOOLS_ENABLED:
+        lines.append(f"    {C.YELLOW}⚠️  Beta feature — offered only after Gemini's Image_Fetch/Image_Create{C.RESET}")
+        lines.append(f"    {C.YELLOW}   fails, and only with your explicit go-ahead each time.{C.RESET}")
+        lines.append(f"    {C.YELLOW}   Image generation via Puter is unverified and may simply fail.{C.RESET}")
+        lines.append(f"    {C.DIM}   vision model: {config.PUTER_VISION_MODEL}  |  image-gen model: {config.PUTER_IMAGE_GEN_MODEL}{C.RESET}")
+
+    lines.append("")
+    lines.append(f"{C.BOLD}Deep Thinking{C.RESET}:")
+    lines.append(f"  Gemini: {'ON' if config.DEEP_THINKING_ENABLED else 'OFF'} "
+                  f"{C.DIM}(toggle with /settings thinking on|off){C.RESET}")
+    if config.DEEP_THINKING_ENABLED:
+        budget_label = "dynamic/auto" if config.DEEP_THINKING_BUDGET == -1 else str(config.DEEP_THINKING_BUDGET)
+        lines.append(f"    {C.DIM}budget: {budget_label}  |  show thoughts: "
+                      f"{'yes' if config.DEEP_THINKING_INCLUDE_THOUGHTS else 'no'}{C.RESET}")
+    lines.append(f"  Puter.js {C.MAGENTA}[BETA]{C.RESET}: {'ON' if config.PUTER_DEEP_THINKING_ENABLED else 'OFF'} "
+                  f"{C.DIM}(toggle with /settings puter thinking on|off){C.RESET}")
+    if config.PUTER_DEEP_THINKING_ENABLED:
+        lines.append(f"    {C.DIM}reasoning effort: {config.PUTER_DEEP_THINKING_EFFORT}{C.RESET}")
+
+    lines.append("")
+    lines.append(f"{C.BOLD}Deep Research{C.RESET} (Google AI Studio):")
+    lines.append(f"  Model: {C.CYAN}{config.DEEP_RESEARCH_MODEL}{C.RESET}")
+    lines.append(f"  Run with: {C.CYAN}/deepresearch <question>{C.RESET}")
 
     lines.append("")
     lines.append(f"{C.DIM}To change things:{C.RESET}")
@@ -765,8 +943,24 @@ def print_settings_menu(agent):
     lines.append(f"  {C.CYAN}/settings role <role> <model>{C.RESET}  assign a model to a role, e.g.")
     lines.append(f"                                 /settings role planner gemini-2.5-pro")
     lines.append(f"  {C.CYAN}/settings chain <m1,m2,...>{C.RESET}    replace the failover chain order")
-    lines.append(f"  {C.CYAN}/settings puter chat on|off{C.RESET}    use Puter.js models in main chat (plain text only, no tools)")
+    lines.append(f"  {C.CYAN}/settings puter chat on|off{C.RESET}    use Puter.js models in main chat")
     lines.append(f"  {C.CYAN}/settings puter free on|off{C.RESET}    restrict Puter.js calls to models with 'free' in the name")
+    lines.append(f"  {C.CYAN}/settings puter tools on|off{C.RESET}   {C.MAGENTA}[BETA]{C.RESET} let Puter.js models call the agent's tools")
+    lines.append(f"  {C.CYAN}/settings puter images on|off{C.RESET}  {C.MAGENTA}[BETA]{C.RESET} offer Puter.js as a fallback when Gemini image tools fail")
+    lines.append(f"  {C.CYAN}/settings puter vision-model <model>{C.RESET}  Puter model for Image_Fetch_Puter (default: gpt-4o)")
+    lines.append(f"  {C.CYAN}/settings puter image-model <model>{C.RESET}   Puter model for Image_Create_Puter (default: gpt-image-1)")
+    lines.append(f"  {C.CYAN}/settings thinking on|off{C.RESET}      toggle Gemini Deep Thinking")
+    lines.append(f"  {C.CYAN}/settings thinking budget <n|auto>{C.RESET}  set thinking token budget (-1/auto = dynamic)")
+    lines.append(f"  {C.CYAN}/settings thinking show on|off{C.RESET} show/hide the model's thought summaries")
+    lines.append(f"  {C.CYAN}/settings puter thinking on|off{C.RESET}       {C.MAGENTA}[BETA]{C.RESET} toggle Puter.js Deep Thinking (reasoning_effort)")
+    lines.append(f"  {C.CYAN}/settings puter thinking effort <low|medium|high>{C.RESET}  set Puter reasoning effort")
+    lines.append(f"  {C.CYAN}/settings deepresearch model <model-id>{C.RESET}  set the Deep Research model")
+    lines.append("")
+    lines.append(f"{C.BOLD}System access{C.RESET}: {'ON' if config.SYSTEM_ACCESS_ENABLED else 'OFF'} "
+                  f"{C.DIM}(toggle with /settings system access on|off){C.RESET}")
+    lines.append(f"    {C.DIM}Gates Available_Active_Windows (open windows) and{C.RESET}")
+    lines.append(f"    {C.DIM}List_System_Processes (Task-Manager-style process list). Off by default.{C.RESET}")
+    lines.append(f"  {C.CYAN}/settings system access on|off{C.RESET}  allow/deny window & process access tools")
 
     print(draw_box("Settings", lines, color=C.TEAL))
 
@@ -815,6 +1009,23 @@ def handle_settings_subcommand(agent, rest: str):
         config.MULTI_AGENT_ROLES[role] = model_name
         _persist_current_settings()
         print(f"{C.GREEN}✅ Role '{role}' assigned to model '{model_name}'.{C.RESET}")
+        return
+
+    if sub == "system":
+        if len(parts) < 3 or parts[1].strip().lower() != "access" or parts[2].strip().lower() not in ("on", "off"):
+            print(f"{C.YELLOW}⚠️  Usage: /settings system access on|off{C.RESET}")
+            return
+        state = parts[2].strip().lower() == "on"
+        config.SYSTEM_ACCESS_ENABLED = state
+        _persist_current_settings()
+        if state:
+            print(f"{C.MAGENTA}🔓 System access is now ON.{C.RESET}")
+            print(f"{C.YELLOW}⚠️  The AI can now use:{C.RESET}")
+            print(f"{C.YELLOW}   • Available_Active_Windows — list your open windows and screenshot/describe each{C.RESET}")
+            print(f"{C.YELLOW}   • List_System_Processes — a Task-Manager-style listing of ALL system processes{C.RESET}")
+            print(f"{C.DIM}   Turn it back off any time with /settings system access off.{C.RESET}")
+        else:
+            print(f"{C.GREEN}✅ System access is now OFF — those two tools will be refused.{C.RESET}")
         return
 
     if sub == "chain":
@@ -880,8 +1091,60 @@ def handle_settings_subcommand(agent, rest: str):
         return
 
     if sub == "puter":
-        if len(parts) < 3 or parts[1].strip().lower() not in ("chat", "free") or parts[2].strip().lower() not in ("on", "off"):
-            print(f"{C.YELLOW}⚠️  Usage: /settings puter chat on|off   or   /settings puter free on|off{C.RESET}")
+        if len(parts) >= 2 and parts[1].strip().lower() == "vision-model":
+            if len(parts) < 3 or not parts[2].strip():
+                print(f"{C.YELLOW}⚠️  Usage: /settings puter vision-model <model-name>{C.RESET}")
+                return
+            config.PUTER_VISION_MODEL = parts[2].strip()
+            _persist_current_settings()
+            print(f"{C.GREEN}✅ Puter.js vision model (Image_Fetch_Puter) set to '{config.PUTER_VISION_MODEL}'.{C.RESET}")
+            return
+
+        if len(parts) >= 2 and parts[1].strip().lower() == "image-model":
+            if len(parts) < 3 or not parts[2].strip():
+                print(f"{C.YELLOW}⚠️  Usage: /settings puter image-model <model-name>{C.RESET}")
+                return
+            config.PUTER_IMAGE_GEN_MODEL = parts[2].strip()
+            _persist_current_settings()
+            print(f"{C.GREEN}✅ Puter.js image-generation model (Image_Create_Puter) set to "
+                  f"'{config.PUTER_IMAGE_GEN_MODEL}'.{C.RESET}")
+            return
+
+        if len(parts) >= 2 and parts[1].strip().lower() == "thinking":
+            # /settings puter thinking on|off
+            # /settings puter thinking effort <low|medium|high>
+            rest2 = parts[2].strip() if len(parts) >= 3 else ""
+            sub2 = rest2.split(maxsplit=1)
+            if sub2 and sub2[0].lower() == "effort":
+                effort = sub2[1].strip().lower() if len(sub2) > 1 else ""
+                if effort not in ("low", "medium", "high"):
+                    print(f"{C.YELLOW}⚠️  Usage: /settings puter thinking effort <low|medium|high>{C.RESET}")
+                    return
+                config.PUTER_DEEP_THINKING_EFFORT = effort
+                _persist_current_settings()
+                print(f"{C.GREEN}✅ Puter.js Deep Thinking reasoning effort set to '{effort}'.{C.RESET}")
+                return
+            if rest2.lower() not in ("on", "off"):
+                print(f"{C.YELLOW}⚠️  Usage: /settings puter thinking on|off   "
+                      f"or   /settings puter thinking effort <low|medium|high>{C.RESET}")
+                return
+            state2 = rest2.lower() == "on"
+            config.PUTER_DEEP_THINKING_ENABLED = state2
+            _persist_current_settings()
+            if state2:
+                print(f"{C.MAGENTA}🧪 [BETA] Puter.js Deep Thinking is now ON "
+                      f"(reasoning_effort={config.PUTER_DEEP_THINKING_EFFORT}).{C.RESET}")
+                print(f"{C.YELLOW}⚠️  Only reasoning-capable models (o1/o3, deepseek-reasoner, Claude{C.RESET}")
+                print(f"{C.YELLOW}   extended-thinking, etc.) actually use this — other models ignore it.{C.RESET}")
+            else:
+                print(f"{C.GREEN}✅ Puter.js Deep Thinking is now OFF.{C.RESET}")
+            return
+
+        if len(parts) < 3 or parts[1].strip().lower() not in ("chat", "free", "tools", "images") or parts[2].strip().lower() not in ("on", "off"):
+            print(f"{C.YELLOW}⚠️  Usage: /settings puter chat on|off   or   /settings puter free on|off   "
+                  f"or   /settings puter tools on|off {C.MAGENTA}[BETA]{C.RESET}   "
+                  f"or   /settings puter images on|off {C.MAGENTA}[BETA]{C.RESET}   "
+                  f"or   /settings puter thinking on|off {C.MAGENTA}[BETA]{C.RESET}")
             return
         toggle, state = parts[1].strip().lower(), parts[2].strip().lower() == "on"
         if toggle == "chat":
@@ -889,23 +1152,114 @@ def handle_settings_subcommand(agent, rest: str):
             _persist_current_settings()
             if state:
                 print(f"{C.GREEN}✅ Puter.js models can now be used in the main chat.{C.RESET} "
-                      f"{C.DIM}Note: this is plain-text chat only — Puter has no access to tools "
-                      f"(file edits, commands, etc.) for now; that may be added later.{C.RESET}")
+                      f"{C.DIM}Note: by default this is plain-text chat only — enable "
+                      f"/settings puter tools on {C.MAGENTA}[BETA]{C.RESET}{C.DIM} to also let Puter "
+                      f"models call the agent's tools.{C.RESET}")
             else:
                 print(f"{C.GREEN}✅ Puter.js is now limited to /puterJS and /free only (not used in main chat).{C.RESET}")
-        else:  # free
+        elif toggle == "free":
             config.PUTER_FREE_ONLY = state
             _persist_current_settings()
             if state:
                 print(f"{C.GREEN}✅ Puter.js calls are now restricted to models with 'free' in the name.{C.RESET}")
             else:
                 print(f"{C.GREEN}✅ Puter.js calls can now use any model from your account, not just free ones.{C.RESET}")
+        elif toggle == "tools":
+            config.PUTER_TOOL_CALLING_ENABLED = state
+            _persist_current_settings()
+            if state:
+                print(f"{C.MAGENTA}🧪 [BETA] Puter.js tool calling is now ON.{C.RESET}")
+                print(f"{C.YELLOW}⚠️  This is a beta feature and may not work reliably on all models:{C.RESET}")
+                print(f"{C.YELLOW}   • Some Puter models may ignore the available tools entirely.{C.RESET}")
+                print(f"{C.YELLOW}   • Some may return malformed or hallucinated tool calls.{C.RESET}")
+                print(f"{C.YELLOW}   • Behavior has only been spot-checked, not fully verified across{C.RESET}")
+                print(f"{C.YELLOW}     Puter's 500+ models.{C.RESET}")
+                if not config.PUTER_CHAT_ENABLED:
+                    print(f"{C.DIM}   Note: /settings puter chat is currently OFF — turn it on too "
+                          f"({C.CYAN}/settings puter chat on{C.RESET}{C.DIM}) for this to take effect.{C.RESET}")
+            else:
+                print(f"{C.GREEN}✅ Puter.js tool calling is now OFF (plain text only, if Puter chat is enabled).{C.RESET}")
+        else:  # images
+            config.PUTER_IMAGE_TOOLS_ENABLED = state
+            _persist_current_settings()
+            if state:
+                print(f"{C.MAGENTA}🧪 [BETA] Puter.js image fallback is now ON.{C.RESET}")
+                print(f"{C.YELLOW}⚠️  This is a beta feature:{C.RESET}")
+                print(f"{C.YELLOW}   • Only offered after Gemini's Image_Fetch/Image_Create fails.{C.RESET}")
+                print(f"{C.YELLOW}   • The agent will ask your permission each time before using it.{C.RESET}")
+                print(f"{C.YELLOW}   • Image GENERATION via Puter is unverified — Puter's own docs only{C.RESET}")
+                print(f"{C.YELLOW}     show it working in the browser, not through this REST path.{C.RESET}")
+                print(f"{C.YELLOW}     It may simply fail; Gemini remains the reliable option.{C.RESET}")
+                if not config.load_puter_token():
+                    print(f"{C.DIM}   Note: no Puter.js token configured yet — use /puterJS first, or{C.RESET}")
+                    print(f"{C.DIM}   this fallback won't actually be offered.{C.RESET}")
+            else:
+                print(f"{C.GREEN}✅ Puter.js image fallback is now OFF (Gemini-only for images).{C.RESET}")
+        return
+
+    if sub == "thinking":
+        # /settings thinking on|off
+        # /settings thinking budget <n|auto>
+        # /settings thinking show on|off
+        if len(parts) >= 2 and parts[1].strip().lower() == "budget":
+            if len(parts) < 3 or not parts[2].strip():
+                print(f"{C.YELLOW}⚠️  Usage: /settings thinking budget <n|auto>  "
+                      f"(auto/-1 = let the model decide, 0 = disable thinking){C.RESET}")
+                return
+            raw = parts[2].strip().lower()
+            if raw == "auto":
+                config.DEEP_THINKING_BUDGET = -1
+            else:
+                try:
+                    config.DEEP_THINKING_BUDGET = int(raw)
+                except ValueError:
+                    print(f"{C.YELLOW}⚠️  Budget must be an integer or 'auto'.{C.RESET}")
+                    return
+            _persist_current_settings()
+            label = "dynamic/auto" if config.DEEP_THINKING_BUDGET == -1 else str(config.DEEP_THINKING_BUDGET)
+            print(f"{C.GREEN}✅ Gemini Deep Thinking budget set to {label}.{C.RESET}")
+            return
+
+        if len(parts) >= 2 and parts[1].strip().lower() == "show":
+            if len(parts) < 3 or parts[2].strip().lower() not in ("on", "off"):
+                print(f"{C.YELLOW}⚠️  Usage: /settings thinking show on|off{C.RESET}")
+                return
+            config.DEEP_THINKING_INCLUDE_THOUGHTS = parts[2].strip().lower() == "on"
+            _persist_current_settings()
+            print(f"{C.GREEN}✅ Showing thought summaries: "
+                  f"{'ON' if config.DEEP_THINKING_INCLUDE_THOUGHTS else 'OFF'}.{C.RESET}")
+            return
+
+        if len(parts) < 2 or parts[1].strip().lower() not in ("on", "off"):
+            print(f"{C.YELLOW}⚠️  Usage: /settings thinking on|off   or   /settings thinking budget <n|auto>   "
+                  f"or   /settings thinking show on|off{C.RESET}")
+            return
+        state3 = parts[1].strip().lower() == "on"
+        config.DEEP_THINKING_ENABLED = state3
+        _persist_current_settings()
+        if state3:
+            print(f"{C.GREEN}✅ Gemini Deep Thinking is now ON "
+                  f"(budget={'auto' if config.DEEP_THINKING_BUDGET == -1 else config.DEEP_THINKING_BUDGET}).{C.RESET}")
+            print(f"{C.DIM}   Only thinking-capable Gemini models (2.5/3.x line) actually use this — {C.RESET}")
+            print(f"{C.DIM}   other models ignore it. Thinking uses extra tokens and can be slower.{C.RESET}")
+        else:
+            print(f"{C.GREEN}✅ Gemini Deep Thinking is now OFF.{C.RESET}")
+        return
+
+    if sub == "deepresearch":
+        if len(parts) < 3 or parts[1].strip().lower() != "model" or not parts[2].strip():
+            print(f"{C.YELLOW}⚠️  Usage: /settings deepresearch model <model-id>{C.RESET}")
+            print(f"{C.DIM}   Current: {config.DEEP_RESEARCH_MODEL}{C.RESET}")
+            return
+        config.DEEP_RESEARCH_MODEL = parts[2].strip()
+        _persist_current_settings()
+        print(f"{C.GREEN}✅ Deep Research model set to '{config.DEEP_RESEARCH_MODEL}'.{C.RESET}")
         return
 
     print(f"{C.YELLOW}⚠️  Unknown /settings subcommand '{sub}'. Try /settings for the menu.{C.RESET}")
 
 
-def _send_and_print(agent, message: str, image_paths: list = None):
+def _send_and_print(agent, message: str, image_paths: list = None, puter_model: Optional[str] = None):
     """
     Shared helper: sends a message to the agent via the standard streaming
     flow (status line wired up, error handling included) and prints the
@@ -918,13 +1272,21 @@ def _send_and_print(agent, message: str, image_paths: list = None):
     single-model flow. Image attachments always use the plain flow since
     the multi-agent prompts aren't built to carry image parts through the
     planning stage.
+
+    Args:
+        puter_model: BETA. If set (via /model puter <id>), routes this
+            message through Puter instead of Gemini for the rest of this
+            session — see handle_model_command()'s docstring. Takes
+            priority over multi-agent mode (multi-agent's classify/plan/
+            execute/review pipeline is Gemini-only; a Puter model active
+            via /model always uses the plain single-model flow instead).
     """
     status = LiveStatusLine()
     tools.set_activity_callback(make_activity_printer(status))
     agent.router.set_status_callback(status.set_activity)
     status.start()
 
-    if config.MULTI_AGENT_ENABLED and not image_paths:
+    if config.MULTI_AGENT_ENABLED and not image_paths and not puter_model:
         try:
             print_multi_agent_turn(agent.run_multi_agent_turn(message), status)
         except RuntimeError as e:
@@ -936,7 +1298,7 @@ def _send_and_print(agent, message: str, image_paths: list = None):
         return
 
     try:
-        print_reply_streaming(agent.send_stream(message, image_paths=image_paths), status)
+        print_reply_streaming(agent.send_stream(message, image_paths=image_paths, puter_model=puter_model), status)
     except RuntimeError as e:
         status.stop()
         print(f"\n{C.RED}❌ All models failed: {e}{C.RESET}\n")
@@ -1028,9 +1390,12 @@ def main():
     print(draw_box("Session", info_lines, color=C.CYAN))
     print()
 
+    current_puter_model: Optional[str] = None  # /model — session-only Gemini/Puter override, see handle_model_command()
+
     while True:
         try:
-            user_input = input(f"{C.BOLD}{C.MAGENTA}You{C.RESET} {C.MAGENTA}›{C.RESET} ").strip()
+            prompt_model_tag = f" {C.DIM}[{current_puter_model} via Puter]{C.RESET}" if current_puter_model else ""
+            user_input = _clean_user_input(input(f"{C.BOLD}{C.MAGENTA}You{C.RESET}{prompt_model_tag} {C.MAGENTA}›{C.RESET} "))
         except (EOFError, KeyboardInterrupt):
             print(f"\n{C.CYAN}👋 Goodbye!{C.RESET}")
             break
@@ -1162,7 +1527,7 @@ def main():
                              f"{C.MAGENTA}›{C.RESET} ").strip()
             if not message:
                 message = "Describe these images." if len(image_paths) > 1 else "Describe this image."
-            _send_and_print(agent, message, image_paths=image_paths)
+            _send_and_print(agent, message, image_paths=image_paths, puter_model=current_puter_model)
             continue
 
         if user_input == "/force_review":
@@ -1173,7 +1538,7 @@ def main():
             file_count = review_message.count("\n- ")
             print(f"{C.YELLOW}🔍 Forcing a full review of {file_count} file(s)... "
                   f"this may take a while and use more tokens than usual.{C.RESET}")
-            _send_and_print(agent, review_message)
+            _send_and_print(agent, review_message, puter_model=current_puter_model)
             continue
 
         if user_input == "/multi-agent":
@@ -1198,6 +1563,11 @@ def main():
 
         if user_input.startswith("/settings "):
             handle_settings_subcommand(agent, user_input[len("/settings "):])
+            continue
+
+        if user_input == "/model" or user_input.startswith("/model "):
+            model_args = user_input[len("/model"):].strip()
+            current_puter_model = handle_model_command(agent, model_args, current_puter_model)
             continue
 
         if user_input == "/stats":
@@ -1232,6 +1602,11 @@ def main():
             handle_free_command(agent)
             continue
 
+        if user_input == "/deepresearch" or user_input.startswith("/deepresearch "):
+            query = user_input[len("/deepresearch"):].strip()
+            handle_deepresearch_command(agent, query)
+            continue
+
         # ---------- unrecognized slash command ----------
         # Anything starting with '/' that didn't match a known command above
         # (including a lone '/' that somehow slipped past the earlier check,
@@ -1243,7 +1618,7 @@ def main():
             continue
 
         # ---------- regular message sent to the Agent (streamed) ----------
-        _send_and_print(agent, user_input)
+        _send_and_print(agent, user_input, puter_model=current_puter_model)
 
 
 if __name__ == "__main__":

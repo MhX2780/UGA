@@ -383,6 +383,134 @@ PUTER_CHAT_ENABLED = _saved_settings.get("puter_chat_enabled", False)
 # otherwise selected. This keeps usage on Puter's no-cost tier only.
 PUTER_FREE_ONLY = _saved_settings.get("puter_free_only", False)
 
+# ---------- Puter.js tool calling (BETA) ----------
+# If ON, chat turns routed through Puter (i.e. PUTER_CHAT_ENABLED=True) are
+# given the full tools.ALL_TOOLS toolbox, translated to the OpenAI-style
+# `tools=[{"type": "function", "function": {...}}]` schema, and the agent
+# will execute any tool_calls the model returns — the same file/git/command
+# tools available to Gemini, now also reachable via Puter models.
+#
+# BETA — off by default. Two real sources of risk, both confirmed against
+# Puter's own docs before this was added:
+#   1) Puter's REST endpoint used here (api.puter.com/puterai/openai/v1/,
+#      hit via the standard `openai` SDK) is a different code path than the
+#      puter.ai.chat() JS client shown in Puter's official tool-calling
+#      examples. The *documented* request/response shape (tools param,
+#      tool_calls in the response, role:"tool" reply format) matches OpenAI's
+#      own convention closely, and Puter's REST endpoint is advertised as
+#      OpenAI-compatible — but this hasn't been exercised against every
+#      model Puter re-exposes, only spot-checked.
+#   2) Not every model available through Puter actually supports function
+#      calling well even when the request is formatted correctly — smaller
+#      or free-tier models in particular may ignore the tools list, or
+#      "hallucinate" a tool call that doesn't match any real tool. Gemini
+#      models remain the well-tested, fully-supported path for tool-calling;
+#      this setting extends that capability to Puter models on a best-effort
+#      basis, not a guaranteed one.
+#
+# Toggle with /settings puter tools on|off in the CLI.
+PUTER_TOOL_CALLING_ENABLED = _saved_settings.get("puter_tool_calling_enabled", False)
+
+
+# ---------- Puter.js image tools (BETA, opt-in fallback) ----------
+# If ON, when Image_Fetch or Image_Create fails via Gemini, the tool's
+# error message tells the model that a Puter.js fallback is available (but
+# does NOT call it automatically) — the model is expected to ask the user
+# for permission first, then call Image_Fetch_Puter / Image_Create_Puter
+# explicitly once the user agrees. See tools.py's docstrings on those
+# functions for the full rationale.
+#
+# Off by default, and only offered as a fallback at all when a Puter token
+# is actually configured (config.load_puter_token()) — there's no point
+# suggesting a fallback the user hasn't set up.
+#
+# BETA scope notes, confirmed against Puter's own documentation:
+#   - Image_Fetch_Puter (vision/image-understanding) uses Puter's
+#     documented, REST-compatible chat.completions endpoint with an image
+#     content part — the same code path already verified for text and
+#     tool-calling in this app. Reasonably safe to rely on.
+#   - Image_Create_Puter (image GENERATION) is a different story: Puter's
+#     own documented image-generation function, puter.ai.txt2img(), is
+#     ONLY demonstrated in Puter's docs via the browser JavaScript SDK
+#     (HTMLImageElement return value, puter.print, etc.) — no official
+#     example anywhere shows an image-generation REST endpoint analogous
+#     to OpenAI's /v1/images/generations reachable from Python/the openai
+#     SDK. Image_Create_Puter below attempts the OpenAI SDK's standard
+#     images.generate() call against Puter's base_url as a best-effort,
+#     since Puter advertises OpenAI-compatibility broadly — but this
+#     specific capability has NOT been confirmed to exist server-side by
+#     any documentation found. It may simply 404. Treat this one as
+#     genuinely experimental, more so than every other Puter integration
+#     in this file.
+PUTER_IMAGE_TOOLS_ENABLED = _saved_settings.get("puter_image_tools_enabled", False)
+
+# Puter model used for Image_Fetch_Puter (vision-capable). Kept separate
+# from the text MODEL_CHAIN/MULTI_AGENT_ROLES since it must specifically
+# support image inputs — not every model Puter re-exposes does.
+PUTER_VISION_MODEL = _saved_settings.get("puter_vision_model", "gpt-4o")
+
+# Puter model used for Image_Create_Puter (image generation) — see the
+# BETA note above; this path is unverified server-side.
+PUTER_IMAGE_GEN_MODEL = _saved_settings.get("puter_image_gen_model", "gpt-image-1")
+
+
+# ---------------- Deep Thinking (Gemini) ----------------
+# If ON, requests to Gemini models go out with an explicit thinking
+# configuration attached (google.genai.types.ThinkingConfig), asking the
+# model to spend extra internal reasoning tokens before answering. Only
+# Gemini's "thinking" family (2.5/3.x line) actually honors this — passing
+# it to a model that doesn't support thinking is harmless (the SDK/backend
+# ignores unknown-to-it config), but it's still gated behind this toggle so
+# it's not silently on by default (thinking tokens cost more and are slower).
+#
+# thinking_budget: -1 lets the model decide how much to think (Google's
+# "dynamic thinking"); a positive integer caps the thinking-token budget;
+# 0 disables thinking outright. include_thoughts: if True, the model's
+# thought summaries are included in the response (surfaced to the user as
+# a distinct "thinking" section) rather than only used internally.
+DEEP_THINKING_ENABLED = _saved_settings.get("deep_thinking_enabled", False)
+DEEP_THINKING_BUDGET = _saved_settings.get("deep_thinking_budget", -1)  # -1 = dynamic/auto
+DEEP_THINKING_INCLUDE_THOUGHTS = _saved_settings.get("deep_thinking_include_thoughts", True)
+
+# ---------------- Deep Thinking (Puter.js) ----------------
+# Puter's OpenAI-compatible endpoint re-exposes reasoning-capable models
+# (e.g. o1/o3, deepseek-reasoner, and Claude's extended-thinking models)
+# which accept an OpenAI-style `reasoning_effort` field ("low"/"medium"/
+# "high") to control how much hidden reasoning the model performs before
+# answering. This is a SEPARATE toggle from the Gemini one above since it's
+# a different provider/parameter shape — not every Puter model supports
+# reasoning_effort, but sending it to one that doesn't is generally ignored
+# rather than an error, so this is left to the caller/model rather than
+# hard-validated here.
+PUTER_DEEP_THINKING_ENABLED = _saved_settings.get("puter_deep_thinking_enabled", False)
+PUTER_DEEP_THINKING_EFFORT = _saved_settings.get("puter_deep_thinking_effort", "high")  # low|medium|high
+
+# ---------------- System access (windows / processes) ----------------
+# Gates two sensitive tools: Available_Active_Windows (lists the user's
+# currently open windows and can screenshot each one) and
+# List_System_Processes (task-manager-style listing of ALL system
+# processes with PID/CPU/memory, not just ones this agent started).
+#
+# Off by default. When off, both tools return an error telling the model to
+# ask the user, in English, for explicit permission before turning this on
+# (e.g. "Do you allow the AI to access your open windows and system
+# processes?") — see the docstrings on those two tools in tools.py, and the
+# matching instruction in agent.py's system prompt. The user grants access
+# themselves via /settings system access on; the model cannot flip this
+# setting on its own.
+SYSTEM_ACCESS_ENABLED = _saved_settings.get("system_access_enabled", False)
+
+# ---------------- Deep Research (Gemini / Google AI Studio) ----------------
+# Deep Research is a SEPARATE Gemini model family (see
+# _REFERENCE_DEEP_RESEARCH_MODELS above) — it is not a flag on the normal
+# chat models, it's its own model you call directly, purpose-built for
+# multi-step autonomous web research culminating in a long-form report.
+# It is NOT part of MODEL_CHAIN (same reasoning as IMAGE_MODEL_CHAIN: a
+# fundamentally different call shape that the normal failover loop isn't
+# built to handle) — instead it's invoked explicitly via the /deepresearch
+# command (see cli.py) through model_router.run_deep_research().
+DEEP_RESEARCH_MODEL = _saved_settings.get("deep_research_model", "deep-research-pro-preview-12-2025")
+
 
 def get_current_settings_snapshot() -> dict:
     """
@@ -398,6 +526,17 @@ def get_current_settings_snapshot() -> dict:
         "multi_agent_enabled": MULTI_AGENT_ENABLED,
         "puter_chat_enabled": PUTER_CHAT_ENABLED,
         "puter_free_only": PUTER_FREE_ONLY,
+        "puter_tool_calling_enabled": PUTER_TOOL_CALLING_ENABLED,
+        "puter_image_tools_enabled": PUTER_IMAGE_TOOLS_ENABLED,
+        "puter_vision_model": PUTER_VISION_MODEL,
+        "puter_image_gen_model": PUTER_IMAGE_GEN_MODEL,
+        "deep_thinking_enabled": DEEP_THINKING_ENABLED,
+        "deep_thinking_budget": DEEP_THINKING_BUDGET,
+        "deep_thinking_include_thoughts": DEEP_THINKING_INCLUDE_THOUGHTS,
+        "puter_deep_thinking_enabled": PUTER_DEEP_THINKING_ENABLED,
+        "puter_deep_thinking_effort": PUTER_DEEP_THINKING_EFFORT,
+        "deep_research_model": DEEP_RESEARCH_MODEL,
+        "system_access_enabled": SYSTEM_ACCESS_ENABLED,
     }
 
 # Number of retry attempts on the same model before moving to the next one

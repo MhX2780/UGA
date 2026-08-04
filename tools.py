@@ -1874,6 +1874,29 @@ def env_var_check(names: List[str]) -> str:
     return "\n".join(lines)
 
 
+def _puter_image_fallback_hint(action_desc: str) -> str:
+    """
+    Builds the suffix appended to an Image_Fetch/Image_Create failure
+    message when a Puter.js fallback is potentially available, telling the
+    MODEL (not the user directly) to ask the user for permission before
+    trying it — tools can't interactively prompt mid-call, so the model's
+    next reply is what actually asks. Returns "" (no suffix) if the
+    fallback isn't eligible at all (feature toggle off, or no Puter token
+    configured), so the plain Gemini error message is all that's shown in
+    that case rather than dangling a fallback that isn't actually usable.
+    """
+    if not config.PUTER_IMAGE_TOOLS_ENABLED:
+        return ""
+    if not config.load_puter_token():
+        return ""
+    return (
+        f"\n\nℹ️ A Puter.js fallback for {action_desc} is available (BETA — "
+        f"may not work with every model). Ask the user if they'd like you "
+        f"to try {action_desc} via Puter.js instead before calling the "
+        f"corresponding _Puter tool."
+    )
+
+
 def Image_Fetch(path: str, question: str = "Describe this image in detail.") -> str:
     """
     Looks at one or more image files already in the workspace and answers a
@@ -1925,9 +1948,60 @@ def Image_Fetch(path: str, question: str = "Describe this image in detail.") -> 
         _notify("ran", f"viewed {', '.join(paths)}")
         return response.text or "(The model didn't return a text description.)"
     except RuntimeError as e:
-        return f"❌ {e}"
+        return f"❌ {e}{_puter_image_fallback_hint('viewing this image')}"
     except Exception as e:
-        return f"❌ Failed to analyze image(s): {e}"
+        return f"❌ Failed to analyze image(s): {e}{_puter_image_fallback_hint('viewing this image')}"
+
+
+def Image_Fetch_Puter(path: str, question: str = "Describe this image in detail.") -> str:
+    """
+    BETA. Same as Image_Fetch, but via a Puter.js vision-capable model
+    instead of Gemini. ONLY call this after the user has explicitly agreed
+    to try Puter.js for this — e.g. after Image_Fetch failed and you asked
+    them, per the fallback hint in its error message. Do not call this
+    proactively or as a first choice; Image_Fetch (Gemini) remains the
+    default, well-tested path.
+
+    Uses config.PUTER_VISION_MODEL (default "gpt-4o" — configurable via
+    /settings puter vision-model <model>). Requires a Puter token to
+    already be configured.
+
+    Args:
+        path: relative path of the image file (for multiple images, pass a
+            single string with paths separated by commas)
+        question: what you want to know about the image(s)
+    """
+    if not config.PUTER_IMAGE_TOOLS_ENABLED:
+        return "❌ Puter.js image tools are turned off. Enable with /settings puter images on (BETA)."
+    if not config.load_puter_token():
+        return "❌ No Puter.js token configured. Use /puterJS to connect one first."
+
+    paths = [p.strip() for p in path.split(",") if p.strip()]
+    if not paths:
+        return "❌ No image path provided."
+    if len(paths) > 1:
+        return "❌ Image_Fetch_Puter supports one image at a time (unlike Image_Fetch). Call it separately per image."
+
+    try:
+        p = _safe_path(paths[0])
+    except PermissionError as e:
+        return f"❌ {e}"
+    if not p.exists():
+        return f"❌ Image not found: {paths[0]}"
+    ext = p.suffix.lower()
+    if ext not in SUPPORTED_IMAGE_EXTENSIONS:
+        return f"❌ Unsupported image format '{ext}'. Supported: {sorted(SUPPORTED_IMAGE_EXTENSIONS)}"
+
+    try:
+        import providers
+        _notify("running", f"viewing {paths[0]} via Puter.js")
+        result = providers.puter_vision_describe(
+            config.PUTER_VISION_MODEL, p.read_bytes(), _IMAGE_MIME_TYPES[ext], question
+        )
+        _notify("ran", f"viewed {paths[0]} via Puter.js")
+        return result or "(The Puter.js model didn't return a text description.)"
+    except Exception as e:
+        return f"❌ Puter.js vision request failed: {e}"
 
 
 _LAST_SCREENSHOT_PATH = None  # tracks the previous screenshot for frame-differencing
@@ -2028,6 +2102,376 @@ def view_screen(question: str = "Describe what's currently on screen.",
         return f"❌ Failed to analyze the screenshot: {e}"
 
 
+def view_screen_puter(question: str = "Describe what's currently on screen.") -> str:
+    """
+    BETA. Same as view_screen, but analyzes the screenshot via a Puter.js
+    vision-capable model (config.PUTER_VISION_MODEL) instead of Gemini. Use
+    this as a fallback if view_screen fails (e.g. Gemini quota exhausted),
+    or if the user explicitly asked to use Puter.js for screen viewing.
+    Requires a Puter token to already be configured and
+    config.PUTER_IMAGE_TOOLS_ENABLED to be on.
+
+    Args:
+        question: what to ask about the screen (default: general description)
+    """
+    global _LAST_SCREENSHOT_PATH
+    if not config.PUTER_IMAGE_TOOLS_ENABLED:
+        return "❌ Puter.js image tools are turned off. Enable with /settings puter images on (BETA)."
+    if not config.load_puter_token():
+        return "❌ No Puter.js token configured. Use /puterJS to connect one first."
+
+    try:
+        from PIL import ImageGrab
+    except ImportError:
+        return "❌ Screen viewing requires the 'Pillow' package (pip install Pillow)."
+
+    _notify("running", "capturing screen")
+    try:
+        screenshot = ImageGrab.grab()
+    except Exception as e:
+        _notify("ran", "capturing screen")
+        return f"❌ Could not capture the screen: {e}. No graphical display available?"
+    _notify("ran", "capturing screen")
+
+    screenshots_dir = config.WORKSPACE_DIR / ".undo_history" / "screenshots"
+    screenshots_dir.mkdir(parents=True, exist_ok=True)
+    new_path = screenshots_dir / f"screen_{int(time.time() * 1000)}.png"
+    screenshot.save(new_path, "PNG")
+    _LAST_SCREENSHOT_PATH = new_path
+
+    try:
+        import providers
+        _notify("running", "viewing screen via Puter.js")
+        result = providers.puter_vision_describe(
+            config.PUTER_VISION_MODEL, new_path.read_bytes(), "image/png", question
+        )
+        _notify("ran", "viewed screen via Puter.js")
+        return result or "(The Puter.js model didn't return a description.)"
+    except Exception as e:
+        return f"❌ Puter.js vision request failed: {e}"
+
+
+def watch_screen(question: str = "Describe what's currently on screen, and note anything new or changed.",
+                  duration_seconds: int = 30, interval_seconds: int = 5,
+                  change_threshold: float = 2.0, use_puter: bool = False) -> str:
+    """
+    Watches the user's screen like a live feed for a period of time: takes
+    repeated screenshots every `interval_seconds`, skips any that look
+    essentially unchanged from the previous frame (saving API calls), and
+    analyzes the ones that DID change. Returns a single timestamped log of
+    everything observed during the watch window — this is the closest thing
+    to "streaming" the screen to the model, since a real continuous video
+    stream isn't possible through the text/image API used here.
+
+    Use this when the user wants ongoing monitoring — e.g. "tell me when the
+    build finishes", "watch what I'm doing and guide me", "let me know if an
+    error dialog pops up" — instead of calling view_screen over and over
+    yourself. Runs synchronously for the requested duration, so keep
+    duration_seconds reasonable (this ties up the current turn); for
+    longer/background watching, prefer running it multiple times with
+    shorter windows, or wrap it via start_background_process if truly
+    unattended monitoring is needed.
+
+    Args:
+        question: what to look for / describe on each changed frame
+        duration_seconds: total time to watch, in seconds (default 30, keep
+            this modest — e.g. 15-120 — since it blocks the conversation)
+        interval_seconds: seconds between each screenshot check (default 5;
+            lower = more responsive but more API calls/cost)
+        change_threshold: percentage of changed pixels (0-100) required to
+            count a frame as "changed" and worth analyzing (default 2.0)
+        use_puter: if True, analyze changed frames via Puter.js
+            (view_screen_puter's model) instead of Gemini — requires a
+            configured Puter token and config.PUTER_IMAGE_TOOLS_ENABLED
+    """
+    try:
+        from PIL import Image, ImageGrab, ImageChops, ImageStat
+    except ImportError:
+        return "❌ Screen watching requires the 'Pillow' package (pip install Pillow)."
+
+    if use_puter:
+        if not config.PUTER_IMAGE_TOOLS_ENABLED:
+            return "❌ Puter.js image tools are turned off. Enable with /settings puter images on (BETA)."
+        if not config.load_puter_token():
+            return "❌ No Puter.js token configured. Use /puterJS to connect one first."
+
+    duration_seconds = max(5, min(duration_seconds, 600))  # hard safety cap: 10 minutes max
+    interval_seconds = max(1, interval_seconds)
+
+    screenshots_dir = config.WORKSPACE_DIR / ".undo_history" / "screenshots"
+    screenshots_dir.mkdir(parents=True, exist_ok=True)
+
+    log_lines = []
+    previous_img = None
+    start = time.time()
+    frame_count = 0
+    analyzed_count = 0
+
+    _notify("running", f"watching screen for {duration_seconds}s")
+    try:
+        while time.time() - start < duration_seconds:
+            try:
+                shot = ImageGrab.grab()
+            except Exception as e:
+                log_lines.append(f"[error] could not capture screen: {e}")
+                break
+            frame_count += 1
+            elapsed = round(time.time() - start, 1)
+            current_img = shot.convert("RGB")
+
+            changed = True
+            changed_pct = 100.0
+            if previous_img is not None and previous_img.size == current_img.size:
+                diff_gray = ImageChops.difference(previous_img, current_img).convert("L")
+                binary_mask = diff_gray.point(lambda p: 255 if p > 10 else 0)
+                changed_pct = ImageStat.Stat(binary_mask).mean[0] / 255.0 * 100.0
+                changed = changed_pct >= change_threshold
+
+            if changed:
+                frame_path = screenshots_dir / f"watch_{int(time.time() * 1000)}.png"
+                shot.save(frame_path, "PNG")
+                try:
+                    if use_puter:
+                        import providers
+                        desc = providers.puter_vision_describe(
+                            config.PUTER_VISION_MODEL, frame_path.read_bytes(), "image/png", question
+                        )
+                    else:
+                        from google.genai import types
+                        client = _get_image_client()
+                        response = client.models.generate_content(
+                            model=IMAGE_UNDERSTANDING_MODEL,
+                            contents=[question, types.Part.from_bytes(
+                                data=frame_path.read_bytes(), mime_type="image/png")],
+                        )
+                        desc = response.text
+                    analyzed_count += 1
+                    log_lines.append(f"[t={elapsed}s, {changed_pct:.1f}% changed] {desc or '(no description)'}")
+                except Exception as e:
+                    log_lines.append(f"[t={elapsed}s] ❌ analysis failed: {e}")
+            previous_img = current_img
+
+            time.sleep(max(0, interval_seconds - (time.time() - start - elapsed)))
+    finally:
+        _notify("ran", f"watched screen for {round(time.time() - start, 1)}s")
+
+    if not log_lines:
+        return (
+            f"ℹ️ Watched the screen for {round(time.time() - start, 1)}s "
+            f"({frame_count} frame(s) captured) — no meaningful changes detected "
+            f"(threshold {change_threshold}%)."
+        )
+
+    header = (
+        f"👁️ Screen watch log — {round(time.time() - start, 1)}s, "
+        f"{frame_count} frame(s) captured, {analyzed_count} analyzed "
+        f"(via {'Puter.js' if use_puter else 'Gemini'}):\n"
+    )
+    return header + "\n".join(log_lines)
+
+
+def _require_system_access() -> Optional[str]:
+    """
+    Returns None if system access (windows/processes) is permitted, or an
+    error string to return from the calling tool if not. This gate is
+    OFF by default and can only be turned on by the USER (via
+    /settings system access on) — never by the model itself. If it's off,
+    the model must ask the user for permission IN ENGLISH before the user
+    can enable it, e.g.: "Do you allow the AI to access your open windows
+    and system processes? If so, please run: /settings system access on".
+    """
+    if not config.SYSTEM_ACCESS_ENABLED:
+        return (
+            "❌ System access (windows/processes) is not permitted yet. "
+            "Ask the user, in English, something like: \"Do you allow the AI "
+            "to access your open windows and running system processes?\" "
+            "If they agree, tell them to run /settings system access on — "
+            "the model cannot enable this itself."
+        )
+    return None
+
+
+def Available_Active_Windows(include_screenshots: bool = True, max_windows: int = 10) -> str:
+    """
+    Lists the user's currently open/active windows (title + owning
+    application), and — if include_screenshots is True — captures a
+    screenshot of each visible window and describes it (including any
+    visible text) using the vision model. This gives the AI a picture of
+    everything the user has open right now, not just the single
+    foreground window that view_screen/watch_screen capture.
+
+    REQUIRES EXPLICIT USER PERMISSION first — see _require_system_access.
+    If permission hasn't been granted, this returns an error telling you
+    to ask the user in English before it can be used.
+
+    Platform support: Windows and macOS via the 'pygetwindow' package
+    (pip install pygetwindow); Linux via the 'wmctrl' command-line tool
+    (install with e.g. apt install wmctrl). Falls back to a clear error if
+    neither is available.
+
+    Args:
+        include_screenshots: if True (default), also screenshots and
+            visually describes each window (slower, costs one vision
+            request per window). If False, only lists titles/apps —
+            fast, no vision calls.
+        max_windows: safety cap on how many windows to screenshot/describe
+            (default 10) — a list of titles is always returned in full
+            regardless of this cap.
+    """
+    perm_error = _require_system_access()
+    if perm_error:
+        return perm_error
+
+    windows = []  # list of dicts: title, app, bbox (left, top, right, bottom) or None
+
+    try:
+        import pygetwindow as gw
+        for w in gw.getAllWindows():
+            title = (w.title or "").strip()
+            if not title:
+                continue
+            bbox = None
+            try:
+                if w.visible and w.width > 0 and w.height > 0:
+                    bbox = (w.left, w.top, w.left + w.width, w.top + w.height)
+            except Exception:
+                bbox = None
+            windows.append({"title": title, "app": "", "bbox": bbox})
+    except ImportError:
+        # Linux fallback: wmctrl -l gives "<id> <desktop> <host> <title>"
+        import subprocess
+        try:
+            out = subprocess.run(["wmctrl", "-l"], capture_output=True, text=True, timeout=5)
+            if out.returncode != 0:
+                raise RuntimeError(out.stderr.strip() or "wmctrl failed")
+            for line in out.stdout.splitlines():
+                parts = line.split(None, 3)
+                if len(parts) == 4:
+                    windows.append({"title": parts[3].strip(), "app": "", "bbox": None})
+        except FileNotFoundError:
+            return (
+                "❌ Could not list windows: install 'pygetwindow' (pip install "
+                "pygetwindow) on Windows/macOS, or 'wmctrl' (apt install wmctrl) "
+                "on Linux."
+            )
+        except Exception as e:
+            return f"❌ Could not list windows via wmctrl: {e}"
+    except Exception as e:
+        return f"❌ Could not list windows: {e}"
+
+    if not windows:
+        return "ℹ️ No open windows detected (or the window manager didn't report any titles)."
+
+    lines = [f"🪟 {len(windows)} open window(s):"]
+    for i, w in enumerate(windows, 1):
+        lines.append(f"{i}. {w['title']}")
+
+    if not include_screenshots:
+        return "\n".join(lines)
+
+    try:
+        from PIL import ImageGrab
+        from google.genai import types
+    except ImportError:
+        lines.append("\n⚠️ Pillow not installed — skipping per-window screenshots.")
+        return "\n".join(lines)
+
+    screenshots_dir = config.WORKSPACE_DIR / ".undo_history" / "screenshots"
+    screenshots_dir.mkdir(parents=True, exist_ok=True)
+
+    described = 0
+    lines.append("")
+    for w in windows:
+        if described >= max_windows:
+            lines.append(f"... ({len(windows) - described} more window(s) not screenshotted — max_windows={max_windows} reached)")
+            break
+        if not w["bbox"]:
+            continue
+        try:
+            _notify("running", f"capturing window: {w['title']}")
+            shot = ImageGrab.grab(bbox=w["bbox"])
+            frame_path = screenshots_dir / f"win_{int(time.time() * 1000)}.png"
+            shot.save(frame_path, "PNG")
+            client = _get_image_client()
+            response = client.models.generate_content(
+                model=IMAGE_UNDERSTANDING_MODEL,
+                contents=["Briefly describe what's shown in this window, including any visible text.",
+                          types.Part.from_bytes(data=frame_path.read_bytes(), mime_type="image/png")],
+            )
+            lines.append(f"🔎 [{w['title']}]: {response.text or '(no description)'}")
+            described += 1
+            _notify("ran", f"captured window: {w['title']}")
+        except Exception as e:
+            lines.append(f"⚠️ [{w['title']}]: could not capture/describe ({e})")
+
+    return "\n".join(lines)
+
+
+def List_System_Processes(sort_by: str = "cpu", limit: int = 20) -> str:
+    """
+    Task-Manager-style listing of ALL processes currently running on the
+    system (not just ones started by this agent — see
+    list_background_processes for that narrower, always-available tool).
+    Shows PID, process name, CPU%, memory%, and status for each.
+
+    REQUIRES EXPLICIT USER PERMISSION first — see _require_system_access.
+    If permission hasn't been granted, this returns an error telling you
+    to ask the user in English before it can be used.
+
+    Requires the 'psutil' package (pip install psutil).
+
+    Args:
+        sort_by: "cpu" (default) or "memory" — which usage column to sort
+            the results by, highest first
+        limit: max number of processes to show (default 20)
+    """
+    perm_error = _require_system_access()
+    if perm_error:
+        return perm_error
+
+    try:
+        import psutil
+    except ImportError:
+        return "❌ System process listing requires the 'psutil' package (pip install psutil)."
+
+    sort_by = sort_by.strip().lower()
+    if sort_by not in ("cpu", "memory"):
+        return "❌ sort_by must be 'cpu' or 'memory'."
+
+    procs = []
+    # First pass primes cpu_percent's internal sampling; a short interval
+    # gives a real (non-zero) reading instead of always 0.0 on first call.
+    for p in psutil.process_iter(["pid", "name", "status", "memory_percent"]):
+        try:
+            p.cpu_percent(None)
+        except Exception:
+            pass
+    time.sleep(0.15)
+    for p in psutil.process_iter(["pid", "name", "status", "memory_percent"]):
+        try:
+            info = p.info
+            cpu = p.cpu_percent(None)
+            procs.append({
+                "pid": info["pid"],
+                "name": info["name"] or "?",
+                "cpu": cpu,
+                "mem": info.get("memory_percent") or 0.0,
+                "status": info.get("status") or "?",
+            })
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    key = "cpu" if sort_by == "cpu" else "mem"
+    procs.sort(key=lambda x: x[key], reverse=True)
+    procs = procs[:max(1, limit)]
+
+    lines = [f"🖥️ Top {len(procs)} processes by {sort_by.upper()} ({len(list(psutil.process_iter()))} total running):",
+             f"{'PID':>7}  {'CPU%':>6}  {'MEM%':>6}  STATUS      NAME"]
+    for p in procs:
+        lines.append(f"{p['pid']:>7}  {p['cpu']:>6.1f}  {p['mem']:>6.1f}  {p['status']:<10}  {p['name']}")
+    return "\n".join(lines)
+
+
 def Image_Create(prompt: str, output_path: str, aspect_ratio: str = "1:1") -> str:
     """
     Generates an image from a text description using Gemini's built-in
@@ -2076,7 +2520,7 @@ def Image_Create(prompt: str, output_path: str, aspect_ratio: str = "1:1") -> st
             continue  # try the next image model in the chain
 
     if response is None:
-        return f"❌ Failed to generate image (all image models failed): {last_error}"
+        return f"❌ Failed to generate image (all image models failed): {last_error}{_puter_image_fallback_hint('generating this image')}"
 
     image_bytes = None
     for candidate in response.candidates or []:
@@ -2089,13 +2533,74 @@ def Image_Create(prompt: str, output_path: str, aspect_ratio: str = "1:1") -> st
             break
 
     if not image_bytes:
-        return "❌ The model didn't return image data. It may have refused the prompt — check response text/safety filters."
+        return (
+            "❌ The model didn't return image data. It may have refused the "
+            f"prompt — check response text/safety filters.{_puter_image_fallback_hint('generating this image')}"
+        )
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(image_bytes)
     _record_undo("create", output_path, None, existed=False)
     _notify("created", output_path)
     return f"✅ Image generated and saved: {output_path} ({len(image_bytes)} bytes)"
+
+
+def Image_Create_Puter(prompt: str, output_path: str) -> str:
+    """
+    BETA — genuinely experimental (more so than the other Puter tools in
+    this file). Attempts image generation via Puter.js instead of Gemini.
+    ONLY call this after the user has explicitly agreed to try Puter.js for
+    this — e.g. after Image_Create failed and you asked them, per the
+    fallback hint in its error message. Do not call this proactively.
+
+    Important honesty note for whoever is reading this tool's result: this
+    specific capability (image generation through Puter's REST/OpenAI-
+    compatible endpoint, as opposed to Puter's browser-only txt2img JS
+    function) has NOT been confirmed to exist by Puter's own documentation
+    — it may fail outright. If it fails, say so plainly rather than
+    implying Gemini and Puter are equally reliable fallbacks for image
+    generation specifically (they are NOT — only Image_Fetch_Puter, the
+    vision/understanding direction, rests on solidly documented ground).
+
+    Uses config.PUTER_IMAGE_GEN_MODEL (default "gpt-image-1" — configurable
+    via /settings puter image-model <model>). No aspect_ratio parameter
+    (unlike Image_Create) since Puter's supported options here are
+    unverified.
+
+    Args:
+        prompt: a detailed description of the image to generate
+        output_path: relative path to save the generated image to (e.g.
+            "assets/logo.png") — should end in .png
+    """
+    if not config.PUTER_IMAGE_TOOLS_ENABLED:
+        return "❌ Puter.js image tools are turned off. Enable with /settings puter images on (BETA)."
+    if not config.load_puter_token():
+        return "❌ No Puter.js token configured. Use /puterJS to connect one first."
+
+    try:
+        out_path = _safe_path(output_path)
+    except PermissionError as e:
+        return f"❌ {e}"
+    if out_path.suffix.lower() != ".png":
+        return "❌ output_path must end in .png"
+
+    try:
+        import providers
+        _notify("creating", f"{output_path} via Puter.js")
+        image_bytes = providers.puter_image_generate(config.PUTER_IMAGE_GEN_MODEL, prompt)
+    except Exception as e:
+        return (
+            f"❌ Puter.js image generation failed: {e}\n\n"
+            f"ℹ️ This was expected to be possible but is unverified — Puter's own docs "
+            f"only demonstrate image generation via their browser JavaScript SDK, not "
+            f"this REST path. Gemini (Image_Create) remains the reliable option."
+        )
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_bytes(image_bytes)
+    _record_undo("create", output_path, None, existed=False)
+    _notify("created", output_path)
+    return f"✅ Image generated via Puter.js and saved: {output_path} ({len(image_bytes)} bytes)"
 
 
 def list_dependencies() -> str:
@@ -2950,8 +3455,14 @@ ALL_TOOLS = [
     extract_zip,
     env_var_check,
     Image_Fetch,
+    Image_Fetch_Puter,
     Image_Create,
+    Image_Create_Puter,
     view_screen,
+    view_screen_puter,
+    watch_screen,
+    Available_Active_Windows,
+    List_System_Processes,
     list_dependencies,
     add_dependency,
     run_tests,

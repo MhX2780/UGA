@@ -64,6 +64,46 @@ def fetch_available_models(api_key: str) -> list:
     return models
 
 
+def run_deep_research(api_key: str, prompt: str, model_name: Optional[str] = None) -> str:
+    """
+    Runs a single-shot Deep Research request against Google AI Studio's Deep
+    Research model family (see config._REFERENCE_DEEP_RESEARCH_MODELS /
+    config.DEEP_RESEARCH_MODEL). This is a genuinely different capability
+    from the normal chat models in MODEL_CHAIN: Deep Research is Google's
+    own autonomous multi-step web-research agent — it plans a research
+    strategy, issues its own searches, and returns a long-form cited report
+    — rather than a plain text-in/text-out completion. Because of that
+    different shape (much longer running time, no meaningful "streaming
+    partial answer" UX, no failover chain that makes sense for it), it is
+    deliberately NOT wired into ModelRouter's normal generate()/
+    generate_stream() failover loop, and is instead called directly here as
+    its own explicit action — invoked from the CLI via /deepresearch.
+
+    No retry/failover chain is applied: if the Deep Research model itself
+    fails (not GA / not enabled for this key / quota), the exception is
+    raised as-is for the caller to report clearly, rather than silently
+    falling back to a normal chat model — a plain chat model answering in
+    its place would silently produce a much shallower, uncited response
+    while claiming to be a "Deep Research" result, which is misleading.
+    """
+    resolved_model = model_name or config.DEEP_RESEARCH_MODEL
+    client = genai.Client(api_key=api_key)
+    response = client.models.generate_content(
+        model=resolved_model,
+        contents=prompt,
+    )
+    text = getattr(response, "text", None)
+    if text:
+        return text
+    # Fall back to walking the raw parts if .text came back empty (e.g. the
+    # response is only tool/grounding parts with no plain-text part yet).
+    try:
+        parts = response.candidates[0].content.parts or []
+        return "\n".join(p.text for p in parts if getattr(p, "text", None))
+    except Exception:
+        return "(Deep Research returned no text content.)"
+
+
 class ModelRouter:
     def __init__(self, api_key: str):
         # api_key here is kept as the "currently active" key for backward
@@ -294,11 +334,22 @@ class ModelRouter:
         _run_tool_calls. Disabling AFC makes agent.py's manual loop the only
         thing that ever invokes a tool function.
         """
+        thinking_config = None
+        if config.DEEP_THINKING_ENABLED:
+            # thinking_budget=-1 -> "dynamic thinking" (model decides how much
+            # to think); a positive int caps it; 0 disables it. Harmless to
+            # send to a model that doesn't support thinking — it's simply
+            # ignored, so this isn't gated per-model here.
+            thinking_config = types.ThinkingConfig(
+                thinking_budget=config.DEEP_THINKING_BUDGET,
+                include_thoughts=config.DEEP_THINKING_INCLUDE_THOUGHTS,
+            )
         return types.GenerateContentConfig(
             system_instruction=system_instruction if system_instruction else None,
             tools=tools if tools else None,
             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)
             if tools else None,
+            thinking_config=thinking_config,
         )
 
     def _classify_error(self, model_name: str, error: Exception):
@@ -636,6 +687,29 @@ class ModelRouter:
                 continue
             else:
                 raise RuntimeError(f"All models in the chain failed. Last error: {last_error}")
+
+    @staticmethod
+    def extract_thoughts(response) -> str:
+        """
+        Pulls out the model's "thought summary" text from a response, when
+        Deep Thinking is enabled with include_thoughts=True. The google-genai
+        SDK's response.text convenience property deliberately SKIPS parts
+        marked thought=True (so normal callers relying on .text never see
+        raw thinking output mixed into the answer) — this walks the raw
+        candidate parts to surface it separately, for callers (e.g. the CLI)
+        that want to show "🧠 Thinking..." content to the user on request.
+        Returns "" if there's no thought content (thinking disabled, model
+        doesn't support it, or include_thoughts was off).
+        """
+        try:
+            candidates = getattr(response, "candidates", None) or []
+            if not candidates:
+                return ""
+            parts = getattr(candidates[0].content, "parts", None) or []
+            thought_parts = [p.text for p in parts if getattr(p, "thought", False) and getattr(p, "text", None)]
+            return "\n".join(thought_parts)
+        except Exception:
+            return ""
 
     def report(self) -> str:
         """Simple text report on usage and switches, to show the user."""

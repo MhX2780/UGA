@@ -3,6 +3,15 @@ pyyaml>=6.0
 Pillow>=10.0
 requests>=2.31.0
 
+# Optional — only needed for List_System_Processes (task-manager style
+# system-wide process listing). Gated behind /settings system access on.
+psutil>=5.9.0
+
+# Optional — only needed for Available_Active_Windows on Windows/macOS
+# (Linux uses the 'wmctrl' command-line tool instead — apt install wmctrl).
+# Gated behind /settings system access on.
+pygetwindow>=0.0.9; sys_platform != "linux"
+
 # Optional — only needed if you configure a Claude or ChatGPT model for a
 # multi-agent role via /settings role (see providers.py). Not required for
 # normal Gemini-only use.
