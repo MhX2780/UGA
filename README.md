@@ -213,3 +213,4 @@ don't trust the model to have full read/write access to within the workspace.
 ## License
 
 BSD 3-Clause License — see [LICENSE](./LICENSE) for the full text.
+Powered by Anthropic Claude 
