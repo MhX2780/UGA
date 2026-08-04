@@ -447,11 +447,16 @@ PUTER_IMAGE_TOOLS_ENABLED = _saved_settings.get("puter_image_tools_enabled", Fal
 # Puter model used for Image_Fetch_Puter (vision-capable). Kept separate
 # from the text MODEL_CHAIN/MULTI_AGENT_ROLES since it must specifically
 # support image inputs — not every model Puter re-exposes does.
-PUTER_VISION_MODEL = _saved_settings.get("puter_vision_model", "gpt-4o")
+PUTER_VISION_MODEL = _saved_settings.get("puter_vision_model", "infron:deepseek/deepseek-v4-flash:free")
 
 # Puter model used for Image_Create_Puter (image generation) — see the
 # BETA note above; this path is unverified server-side.
-PUTER_IMAGE_GEN_MODEL = _saved_settings.get("puter_image_gen_model", "gpt-image-1")
+PUTER_IMAGE_GEN_MODEL = _saved_settings.get("puter_image_gen_model", "infron:deepseek/deepseek-v4-flash:free")
+
+# Default free Puter model used by /free-puter-models-only when auto-selecting.
+# Should be a model with "free" in its id (Puter's current naming convention
+# for no-cost tier models, e.g. "infron:deepseek/deepseek-v4-flash:free").
+PUTER_FREE_CHAT_MODEL = _saved_settings.get("puter_free_chat_model", "infron:deepseek/deepseek-v4-flash:free")
 
 
 # ---------------- Deep Thinking (Gemini) ----------------
@@ -530,6 +535,7 @@ def get_current_settings_snapshot() -> dict:
         "puter_image_tools_enabled": PUTER_IMAGE_TOOLS_ENABLED,
         "puter_vision_model": PUTER_VISION_MODEL,
         "puter_image_gen_model": PUTER_IMAGE_GEN_MODEL,
+        "puter_free_chat_model": PUTER_FREE_CHAT_MODEL,
         "deep_thinking_enabled": DEEP_THINKING_ENABLED,
         "deep_thinking_budget": DEEP_THINKING_BUDGET,
         "deep_thinking_include_thoughts": DEEP_THINKING_INCLUDE_THOUGHTS,

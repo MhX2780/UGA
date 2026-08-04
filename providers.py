@@ -424,14 +424,25 @@ def puter_list_models() -> list:
 
 def puter_list_free_models() -> list:
     """
-    Same as puter_list_models(), but filtered to only model IDs ending in
-    "free" (case-insensitive), e.g. names like "...:free" or "...-free" that
-    some providers exposed through Puter use to mark a no-cost/limited tier.
-    Used by the /free command so the user can quickly see and pick from only
-    the free-tier models without scrolling through the full 500+ list.
+    Same as puter_list_models(), but filtered to only model IDs that contain
+    "free" (case-insensitive) — matching Puter's current naming convention
+    where free-tier models use a ":free" suffix, e.g.
+    "infron:deepseek/deepseek-v4-flash:free", "openrouter:google/gemma-4-26b-a4b-it:free".
+
+    Also accepts models ending in "-free" or "_free" for forward
+    compatibility. Used by /free and /free-puter-models-only so the user
+    can quickly see and pick from only the free-tier models.
     """
     all_models = puter_list_models()
-    return [m for m in all_models if m.lower().rstrip().endswith("free")]
+    free = []
+    for m in all_models:
+        ml = m.lower()
+        # Puter's current convention: "...:free" (colon-separated suffix)
+        # Also covers "...-free" and "..._free" for future-proofing.
+        if (ml.endswith(":free") or ml.endswith("-free") or ml.endswith("_free")
+                or ":free" in ml):
+            free.append(m)
+    return free
 
 
 # ---------------- unified entrypoints ----------------

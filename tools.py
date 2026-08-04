@@ -1962,7 +1962,7 @@ def Image_Fetch_Puter(path: str, question: str = "Describe this image in detail.
     proactively or as a first choice; Image_Fetch (Gemini) remains the
     default, well-tested path.
 
-    Uses config.PUTER_VISION_MODEL (default "gpt-4o" — configurable via
+    Uses config.PUTER_VISION_MODEL (default "infron:deepseek/deepseek-v4-flash:free" — configurable via
     /settings puter vision-model <model>). Requires a Puter token to
     already be configured.
 
@@ -2562,7 +2562,7 @@ def Image_Create_Puter(prompt: str, output_path: str) -> str:
     generation specifically (they are NOT — only Image_Fetch_Puter, the
     vision/understanding direction, rests on solidly documented ground).
 
-    Uses config.PUTER_IMAGE_GEN_MODEL (default "gpt-image-1" — configurable
+    Uses config.PUTER_IMAGE_GEN_MODEL (default "infron:deepseek/deepseek-v4-flash:free" — configurable
     via /settings puter image-model <model>). No aspect_ratio parameter
     (unlike Image_Create) since Puter's supported options here are
     unverified.

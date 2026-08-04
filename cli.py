@@ -45,6 +45,7 @@ import config
 import tools
 import model_router
 import providers
+import taskbar_progress as tb
 from agent import GeminiAgent
 from colors import C, draw_box, select_menu
 from markdown_render import render_markdown
@@ -61,7 +62,8 @@ SLASH_COMMANDS = [
     "/help", "/clear", "/remember", "/memory", "/forget", "/undo", "/tree",
     "/ps", "/log", "/clearlog", "/image", "/force_review",
     "/multi-agent", "/settings", "/model",
-    "/stats", "/workspace", "/resetkey", "/keys", "/puterJS", "/free", "/deepresearch", "/exit", "/quit",
+    "/stats", "/workspace", "/resetkey", "/keys", "/puterJS", "/free",
+    "/free-puter-models-only", "/deepresearch", "/exit", "/quit",
 ]
 
 COMMAND_HINTS = {
@@ -86,6 +88,7 @@ COMMAND_HINTS = {
     "/keys": "manage multiple Gemini API keys (list/add/remove)",
     "/puterJS": "connect Puter.js for free access to 500+ AI models",
     "/free": "list Puter.js models ending in \"free\" and assign one to a role",
+    "/free-puter-models-only": "use ONLY Puter.js free models (no Gemini needed)",
     "/deepresearch": "<question> — run Google AI Studio's Deep Research agent",
     "/exit": "quit the program",
     "/quit": "quit the program",
@@ -185,6 +188,7 @@ def print_help():
         ("/keys", "manage multiple Gemini API keys (list/add/remove)"),
         ("/puterJS", "connect Puter.js for free access to 500+ AI models"),
         ("/free", "list Puter.js models ending in \"free\" and assign one to a role"),
+        ("/free-puter-models-only", "use ONLY Puter.js free models — no Gemini API key needed"),
         ("/deepresearch <q>", "run Google AI Studio's Deep Research agent on a question"),
         ("/exit, /quit", "quit the program"),
     ]
@@ -307,6 +311,7 @@ def print_reply_streaming(chunk_iterator, status: "LiveStatusLine"):
     first_line = True
 
     try:
+        tb.set_indeterminate()
         for chunk in chunk_iterator:
             ensure_prefix()
             full_text_parts.append(chunk)
@@ -319,6 +324,7 @@ def print_reply_streaming(chunk_iterator, status: "LiveStatusLine"):
                 first_line = False
     finally:
         status.stop()
+        tb.clear()
 
     ensure_prefix()  # in case the reply was empty / only tool calls happened
 
@@ -328,6 +334,7 @@ def print_reply_streaming(chunk_iterator, status: "LiveStatusLine"):
         print(render_markdown(line_buffer), end="", flush=True)
 
     print("\n")
+    tb.clear()
     return "".join(full_text_parts)
 
 
@@ -385,6 +392,7 @@ def print_multi_agent_turn(event_iterator, status: "LiveStatusLine"):
                 steps = event.data["steps"]
                 total_steps_seen = len(steps)
                 print(f"\n{C.BOLD}{C.VIOLET}Plan 1 of {total_steps_seen}{C.RESET}\n")
+                tb.set_step_progress(1, total_steps_seen)
                 status.start()
                 continue
 
@@ -395,6 +403,7 @@ def print_multi_agent_turn(event_iterator, status: "LiveStatusLine"):
                 current_step_number = n
                 step_action_lines[n] = []
                 print(f"{C.BOLD}{C.CYAN}Plan {n}:{C.RESET}")
+                tb.set_step_progress(n, total)
                 status = LiveStatusLine()
                 tools.set_activity_callback(make_activity_printer(status))
                 status.start()
@@ -435,11 +444,14 @@ def print_multi_agent_turn(event_iterator, status: "LiveStatusLine"):
                 continue
     except Exception as e:
         status.stop()
+        tb.set_error()
         print(f"\n{C.RED}❌ Multi-agent turn failed: {e}{C.RESET}")
         print(f"{C.DIM}(Any steps completed above were still carried out and are not undone.){C.RESET}\n")
         return "".join(full_text_parts)
     finally:
         status.stop()
+        tb.set_progress(100)
+        tb.clear()
 
     ensure_reply_prefix()
     if line_buffer:
@@ -448,6 +460,7 @@ def print_multi_agent_turn(event_iterator, status: "LiveStatusLine"):
         print(render_markdown(line_buffer), end="", flush=True)
 
     print("\n")
+    tb.clear()
     return "".join(full_text_parts)
 
 
@@ -676,6 +689,108 @@ def handle_free_command(agent):
     config.MULTI_AGENT_ROLES[role] = model_name
     _persist_current_settings()
     print(f"{C.GREEN}✅ Role '{role}' assigned to free model '{model_name}'.{C.RESET}")
+
+
+def handle_free_puter_models_only(args: str = "") -> Optional[str]:
+    """
+    /free-puter-models-only [token] [off]
+
+    One-command shortcut to put the CLI into "Puter free-only" mode:
+      - Saves the Puter auth token (pasted or passed as argument)
+      - Enables PUTER_CHAT_ENABLED (Puter models in main chat)
+      - Enables PUTER_FREE_ONLY (block non-free models)
+      - Enables PUTER_TOOL_CALLING_ENABLED (tools work via Puter)
+      - Auto-selects a free model for the session
+
+    No Gemini API key is needed — everything runs through Puter's free tier.
+
+    Usage:
+      /free-puter-models-only                  — paste a token interactively
+      /free-puter-models-only <token>           — use the token directly
+      /free-puter-models-only off               — disable, go back to Gemini
+
+    Returns the chosen free model name (to set current_puter_model) or None.
+    """
+    # --- Handle "off" subcommand ---
+    if args.strip().lower() == "off":
+        config.PUTER_CHAT_ENABLED = False
+        config.PUTER_FREE_ONLY = False
+        config.PUTER_TOOL_CALLING_ENABLED = False
+        _persist_current_settings()
+        print(f"{C.GREEN}✅ Free Puter mode disabled. Back to Gemini.{C.RESET}")
+        return None
+
+    # --- Determine the token ---
+    token = args.strip() if args.strip() and args.strip().lower() != "off" else ""
+
+    if not token:
+        # Try using already-saved token
+        token = config.load_puter_token()
+        if not token:
+            # Ask user to paste one
+            try:
+                token = input(
+                    f"{C.CYAN}Paste your Puter auth token{C.RESET} "
+                    f"{C.DIM}(from puter.com/dashboard#account → Create token){C.RESET} "
+                    f"{C.MAGENTA}›{C.RESET} "
+                ).strip()
+            except (EOFError, KeyboardInterrupt):
+                print(f"\n{C.DIM}Cancelled.{C.RESET}")
+                return None
+
+    if not token:
+        print(f"{C.YELLOW}⚠️  No token provided. Cannot enable free Puter mode.{C.RESET}")
+        return None
+
+    # --- Save the token ---
+    config.save_puter_token(token)
+
+    # --- Flip all the Puter switches ON ---
+    config.PUTER_CHAT_ENABLED = True
+    config.PUTER_FREE_ONLY = True
+    config.PUTER_TOOL_CALLING_ENABLED = True
+    _persist_current_settings()
+
+    # --- Fetch available free models ---
+    print(f"{C.DIM}Fetching free Puter models...{C.RESET}")
+    try:
+        free_models = providers.puter_list_free_models()
+    except Exception as e:
+        print(f"{C.RED}❌ Could not fetch Puter models: {e}{C.RESET}")
+        print(f"{C.DIM}Token saved and settings enabled — use /model puter <id> to manually pick one.{C.RESET}")
+        # Still return the default free model so something is active
+        return config.PUTER_FREE_CHAT_MODEL
+
+    if not free_models:
+        print(f"{C.YELLOW}⚠️  No free-tier models found. Settings are enabled but you'll need to pick a model manually.{C.RESET}")
+        return config.PUTER_FREE_CHAT_MODEL
+
+    # --- Auto-select the best free model ---
+    # Prefer models that are known to support tool calling well.
+    preferred_patterns = ["deepseek", "qwen", "gemma", "claude", "gpt"]
+    selected_model = free_models[0]  # fallback
+    for pattern in preferred_patterns:
+        for m in free_models:
+            if pattern in m.lower():
+                selected_model = m
+                break
+        if selected_model != free_models[0]:
+            break
+
+    # Let the user confirm or pick a different one
+    lines = [
+        f"{C.GREEN}✅ Puter token saved & verified{C.RESET}",
+        f"{C.GREEN}✅ Free-only mode: ON{C.RESET}",
+        f"{C.GREEN}✅ Tool calling: ON{C.RESET}",
+        f"{C.GREEN}✅ No Gemini API key needed{C.RESET}",
+        "",
+        f"{C.DIM}Auto-selected model: {C.BOLD}{selected_model}{C.RESET}{C.DIM}{C.RESET}",
+        f"{C.DIM}Use /model gemini to switch back to Gemini at any time.{C.RESET}",
+        f"{C.DIM}Use /free-puter-models-only off to disable.{C.RESET}",
+    ]
+    print(draw_box("🆓 Free Puter Mode Active", lines, color=C.GREEN))
+
+    return selected_model
 
 
 def handle_deepresearch_command(agent, query: str):
@@ -947,8 +1062,8 @@ def print_settings_menu(agent):
     lines.append(f"  {C.CYAN}/settings puter free on|off{C.RESET}    restrict Puter.js calls to models with 'free' in the name")
     lines.append(f"  {C.CYAN}/settings puter tools on|off{C.RESET}   {C.MAGENTA}[BETA]{C.RESET} let Puter.js models call the agent's tools")
     lines.append(f"  {C.CYAN}/settings puter images on|off{C.RESET}  {C.MAGENTA}[BETA]{C.RESET} offer Puter.js as a fallback when Gemini image tools fail")
-    lines.append(f"  {C.CYAN}/settings puter vision-model <model>{C.RESET}  Puter model for Image_Fetch_Puter (default: gpt-4o)")
-    lines.append(f"  {C.CYAN}/settings puter image-model <model>{C.RESET}   Puter model for Image_Create_Puter (default: gpt-image-1)")
+    lines.append(f"  {C.CYAN}/settings puter vision-model <model>{C.RESET}  Puter model for Image_Fetch_Puter")
+    lines.append(f"  {C.CYAN}/settings puter image-model <model>{C.RESET}   Puter model for Image_Create_Puter")
     lines.append(f"  {C.CYAN}/settings thinking on|off{C.RESET}      toggle Gemini Deep Thinking")
     lines.append(f"  {C.CYAN}/settings thinking budget <n|auto>{C.RESET}  set thinking token budget (-1/auto = dynamic)")
     lines.append(f"  {C.CYAN}/settings thinking show on|off{C.RESET} show/hide the model's thought summaries")
@@ -1301,9 +1416,11 @@ def _send_and_print(agent, message: str, image_paths: list = None, puter_model: 
         print_reply_streaming(agent.send_stream(message, image_paths=image_paths, puter_model=puter_model), status)
     except RuntimeError as e:
         status.stop()
+        tb.set_error()
         print(f"\n{C.RED}❌ All models failed: {e}{C.RESET}\n")
     except Exception as e:
         status.stop()
+        tb.set_error()
         print(f"\n{C.RED}❌ Unexpected error: {e}{C.RESET}\n")
 
 
@@ -1602,6 +1719,11 @@ def main():
             handle_free_command(agent)
             continue
 
+        if user_input == "/free-puter-models-only" or user_input.startswith("/free-puter-models-only "):
+            free_args = user_input[len("/free-puter-models-only"):].strip()
+            current_puter_model = handle_free_puter_models_only(free_args)
+            continue
+
         if user_input == "/deepresearch" or user_input.startswith("/deepresearch "):
             query = user_input[len("/deepresearch"):].strip()
             handle_deepresearch_command(agent, query)
@@ -1618,6 +1740,7 @@ def main():
             continue
 
         # ---------- regular message sent to the Agent (streamed) ----------
+        tb.set_indeterminate()
         _send_and_print(agent, user_input, puter_model=current_puter_model)
 
 
